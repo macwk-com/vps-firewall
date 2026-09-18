@@ -41,6 +41,9 @@ VPS Firewall — Debian 13 服务器安全与端口管理
   vpsfw ssh rollback
   vpsfw sync                         # 同步 Fail2ban SSH 端口
   vpsfw logins 7                     # 最近 7 天的 SSH 登录记录
+  vpsfw passwd [用户]                # 修改登录密码
+  vpsfw keys [用户]                  # 查看、添加、删除 SSH 公钥
+  vpsfw password-login off|on        # 关闭或打开 SSH 密码登录
   vpsfw firewall enable|disable
   vpsfw help                         # 显示本帮助
 
@@ -469,7 +472,7 @@ ssh_login_hint() {
     if [[ -n ${server_addr:-} ]] && python3 -c 'import ipaddress,sys; sys.exit(not ipaddress.ip_address(sys.argv[1]).is_global)' "$server_addr" 2>/dev/null; then
         host=$server_addr
     fi
-    printf 'ssh -p %s %s@%s' "$1" "${SUDO_USER:-$(logname 2>/dev/null || id -un)}" "$host"
+    printf 'ssh -p %s %s@%s' "$1" "${2:-${SUDO_USER:-$(logname 2>/dev/null || id -un)}}" "$host"
 }
 ssh_change() {
     local new=$1 old combined comment lookup_status
@@ -815,6 +818,288 @@ menu_logins() {
     done
     show_logins "$((10#$days))"
 }
+# ── SSH login methods: account passwords, public keys and whether password login is allowed. ──
+AUTH_CONF=/etc/ssh/sshd_config.d/00-vpsfw-auth.conf
+
+# Effective sshd setting, e.g. sshd_value passwordauthentication.
+sshd_value() { sshd -T 2>/dev/null | awk -v key="$1" '$1 == key {print $2}'; }
+# Accounts that can log in: root plus regular users with a real shell.
+login_users() {
+    getent passwd | awk -F: '($3 == 0 || ($3 >= 1000 && $3 < 60000)) && $7 !~ /(nologin|false)$/ {print $1}'
+}
+is_login_user() { [[ $'\n'$(login_users)$'\n' == *$'\n'"$1"$'\n'* ]]; }
+user_home() { getent passwd "$1" | cut -d: -f6; }
+# How this SSH connection logged in: sets auth_method, auth_user and auth_key (key fingerprint).
+session_auth() {
+    auth_method='' auth_user='' auth_key=''
+    [[ -n ${client_addr:-} ]] || return 0
+    local line
+    line=$(journalctl -u ssh.service -u sshd.service -o cat --no-pager 2>/dev/null |
+        grep -F -- " from $client_addr port $client_port " | grep '^Accepted ' | tail -n 1) || line=''
+    [[ $line =~ ^Accepted\ ([a-z-]+)\ for\ ([^ ]+)\ from ]] || return 0
+    auth_method=${BASH_REMATCH[1]}; auth_user=${BASH_REMATCH[2]}
+    [[ ! $line =~ (SHA256:[A-Za-z0-9+/]+) ]] || auth_key=${BASH_REMATCH[1]}
+}
+# Sets REPLY to 有密码（上次修改日期）or 没有密码.
+password_state() {
+    local fields=()
+    read -r -a fields <<< "$(passwd -S "$1" 2>/dev/null)" || true
+    if [[ ${fields[1]:-} == P ]]; then REPLY="有密码（${fields[2]:-?} 修改）"; else REPLY='没有密码'; fi
+}
+# Public keys in an authorized_keys file: list them, check a pasted line, or remove one by number.
+key_tool() {
+    python3 - "$@" <<'PY'
+import os, subprocess, sys, tempfile
+op, *args = sys.argv[1:]
+def fingerprint(line):
+    with tempfile.NamedTemporaryFile('w', suffix='.pub') as f:
+        f.write(line + '\n'); f.flush()
+        result = subprocess.run(['ssh-keygen', '-l', '-f', f.name], capture_output=True, text=True)
+    if result.returncode or not result.stdout.strip(): return None
+    _, fp, *rest = result.stdout.split()
+    return fp, (rest[-1].strip('()') if rest else '?'), ' '.join(rest[:-1])
+def keys(path):
+    try: lines = open(path).read().splitlines()
+    except FileNotFoundError: lines = []
+    return lines, [(i, info) for i, line in enumerate(lines)
+                   if line.strip() and not line.lstrip().startswith('#') and (info := fingerprint(line.strip()))]
+if op == 'list':
+    for number, (_, (fp, kind, comment)) in enumerate(keys(args[0])[1], 1):
+        print(number, kind, fp, comment or '-', sep='\t')
+elif op == 'check':
+    line = args[0].strip()
+    if 'PRIVATE KEY' in line:
+        raise SystemExit('这是私钥，千万不要放到服务器上。请粘贴 .pub 文件里的那一行（以 ssh-ed25519 或 ssh-rsa 开头）。')
+    info = fingerprint(line)
+    if not info: raise SystemExit('不是有效的公钥。请粘贴 .pub 文件里完整的一行，例如 ssh-ed25519 AAAA… 备注')
+    print(info[0])
+elif op == 'remove':
+    path, number = args[0], int(args[1])
+    lines, found = keys(path)
+    del lines[found[number - 1][0]]
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.authorized_keys.')
+    with os.fdopen(fd, 'w') as f: f.write(''.join(line + '\n' for line in lines))
+    info = os.stat(path); os.chown(tmp, info.st_uid, info.st_gid); os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+PY
+}
+key_count() { { key_tool list "$(user_home "$1")/.ssh/authorized_keys" || true; } | wc -l; }
+# Status block of menu 11 for one account.
+auth_status() {
+    local user=$1 pa root_login how
+    set_colors
+    pa=$(sshd_value passwordauthentication) || pa=''
+    root_login=$(sshd_value permitrootlogin) || root_login=''
+    section 'SSH 登录方式'
+    if [[ $pa == no ]]; then
+        status_row 密码登录 '● 已关闭' "$c_ok" '只能用密钥登录'
+    else
+        case $root_login in
+            yes) how='root 也可以用密码登录' ;;
+            no) how='root 不能登录 SSH' ;;
+            *) how='root 除外，root 只能用密钥' ;;
+        esac
+        status_row 密码登录 '● 允许' "$c_warn" "$how"
+    fi
+    if [[ -z ${client_addr:-} ]]; then how='服务商控制台（不是 SSH 连接）'
+    elif [[ $auth_method == publickey ]]; then how="$auth_user，用密钥登录"
+    elif [[ -n $auth_method ]]; then how="$auth_user，用密码登录"
+    else how='SSH（查不到是怎么登录的）'; fi
+    printf '  %s%s\n' "$(pad 当前连接 10)" "$how"
+    password_state "$user"
+    printf '  %s%s · 公钥 %s 把\n' "$(pad "$user" 10)" "$REPLY" "$(key_count "$user")"
+}
+# Ask which account to work on; REPLY holds it. Defaults to the account of this connection.
+ask_login_user() {
+    local default=${auth_user:-${SUDO_USER:-root}} value
+    printf '\n可以选的用户：%s\n' "$(login_users | tr '\n' ' ')"
+    while true; do
+        ask value "$1 [回车 = $default]: " || return 1
+        value=${value:-$default}
+        if is_login_user "$value"; then REPLY=$value; return 0; fi
+        printf '%s 不是可以登录的用户。\n' "$value"
+    done
+}
+change_password() {
+    local user=$1 pa root_login state choice pw pw2 generated=0
+    set_colors
+    is_login_user "$user" || die "$user 不是可以登录的用户。"
+    pa=$(sshd_value passwordauthentication) || pa=''
+    root_login=$(sshd_value permitrootlogin) || root_login=''
+    password_state "$user"; state=$REPLY
+    printf '\n修改 %s 的密码（现在：%s）\n' "$user" "$state"
+    if [[ $pa == no ]]; then
+        printf 'SSH 已关闭密码登录，这个密码只在 sudo、su 和服务商网页控制台里用。\n'
+    elif [[ $user == root && $root_login != yes ]]; then
+        printf 'root 不能用密码登录 SSH，这个密码只在 su 和服务商网页控制台里用。\n'
+    elif [[ $state == 没有密码 ]]; then
+        printf '注意：%s 现在没有密码；设置后就能用密码登录 SSH，别人也能对它猜密码。\n' "$user"
+    fi
+    printf '\n  1) 自己输入\n  2) 生成一个随机强密码\n\n'
+    while true; do
+        ask choice '请选择 [回车 = 1]: ' || cancel
+        choice=${choice:-1}
+        [[ $choice != 1 && $choice != 2 ]] || break
+        printf '请输入 1 或 2。\n'
+    done
+    if [[ $choice == 2 ]]; then
+        generated=1
+        pw=$(python3 -c 'import secrets
+a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+print("-".join("".join(secrets.choice(a) for _ in range(5)) for _ in range(4)))')
+    else
+        # The system accepts any password, so enforce a minimum here.
+        while true; do
+            IFS= read -r -s -p '新密码（至少 12 位，输入时不显示）: ' pw || cancel; printf '\n'
+            if (( ${#pw} < 12 )); then printf '太短了，至少要 12 位。\n'; continue; fi
+            if [[ $pw == *"$user"* ]]; then printf '密码里不能包含用户名。\n'; continue; fi
+            IFS= read -r -s -p '再输入一次: ' pw2 || cancel; printf '\n'
+            [[ $pw != "$pw2" ]] || break
+            printf '两次输入的不一样，请重新输入。\n'
+        done
+    fi
+    confirm "确认修改 $user 的密码？" y || cancel '密码没有改'
+    # Through stdin only: the password never appears in arguments, history or logs.
+    printf '%s:%s\n' "$user" "$pw" | chpasswd || die '修改失败，密码没有改。'
+    (( ! generated )) || printf '\n新密码：%s%s%s\n请现在就记下来，脚本不会保存，也不会再显示。\n' "$c_warn" "$pw" "$c_off"
+    printf '\n%s 的密码已修改。当前连接和密钥登录都不受影响。\n' "$user"
+    if [[ $pa != no && ( $user != root || $root_login == yes ) ]]; then
+        printf '如果你用密码登录，先别关当前窗口，新开一个窗口用新密码试一下。\n'
+    fi
+}
+manage_keys() {
+    local user=$1 home file group list count choice value fp number line kind comment mark pa port
+    set_colors
+    is_login_user "$user" || die "$user 不是可以登录的用户。"
+    home=$(user_home "$user"); file=$home/.ssh/authorized_keys; group=$(id -gn "$user")
+    session_auth
+    pa=$(sshd_value passwordauthentication) || pa=''
+    list=$(key_tool list "$file") || die "读不了 $file。"
+    count=0; [[ -z $list ]] || count=$(wc -l <<< "$list")
+    section "$user 的公钥（$count 把）"
+    if (( count == 0 )); then
+        printf '  %s还没有公钥，这个用户不能用密钥登录。%s\n' "$c_dim" "$c_off"
+    else
+        printf '  %s%s%s%s备注%s\n' "$c_dim" "$(pad 编号 6)" "$(pad 类型 10)" "$(pad 指纹 22)" "$c_off"
+        while IFS=$'\t' read -r number kind fp comment; do
+            mark=''
+            [[ $user != "$auth_user" || $fp != "$auth_key" ]] || mark="  ${c_ok}● 当前登录用的${c_off}"
+            printf '  %s%s%s%s%s\n' "$(pad "$number" 6)" "$(pad "$kind" 10)" "$(pad "${fp:0:19}…" 22)" "$comment" "$mark"
+        done <<< "$list"
+    fi
+    printf '\n  1) 添加公钥\n'
+    (( count == 0 )) || printf '  2) 删除公钥\n'
+    printf '\n'
+    while true; do
+        ask choice '请选择（回车返回）: ' && [[ -n $choice ]] || return 0
+        [[ $choice != 1 && ( $choice != 2 || count -eq 0 ) ]] || break
+        printf '没有这个选项。\n'
+    done
+    if [[ $choice == 1 ]]; then
+        printf '\n在你自己电脑上执行 cat ~/.ssh/id_ed25519.pub，把输出的那一行复制过来。\n'
+        printf '还没有密钥的话，先在自己电脑上执行 ssh-keygen -t ed25519。\n\n'
+        while true; do
+            ask value '粘贴公钥（回车返回）: ' && [[ -n $value ]] || return 0
+            if fp=$(key_tool check "$value" 2>&1); then
+                [[ $'\n'$list == *$'\t'"$fp"$'\t'* ]] || break
+                printf '这把公钥已经在里面了。\n'; continue
+            fi
+            printf '%s\n' "$fp"
+            # Swallow the rest of a pasted private key so it is not taken as further answers.
+            if [[ $fp == *私钥* ]]; then while read -r -t 0.3 _; do :; done; fi
+        done
+        install -d -m 700 -o "$user" -g "$group" "$home/.ssh"
+        if [[ -s $file && -n $(tail -c 1 "$file") ]]; then printf '\n' >> "$file"; fi
+        printf '%s\n' "$value" >> "$file"
+        chown "$user:$group" "$file"; chmod 600 "$file"
+        printf '\n已添加。现在可以在你电脑上用这把密钥登录 %s。\n' "$user"
+        port=${session_port:-$(ssh_ports | cut -d, -f1)}
+        printf '    %s\n' "$(ssh_login_hint "${port:-22}" "$user")"
+        # sshd ignores keys when the home directory is writable by others.
+        if (( 8#$(stat -c %a "$home") & 8#022 )); then
+            printf '注意：%s 的权限是 %s，SSH 会拒绝使用公钥；执行 chmod 755 %s 即可。\n' "$home" "$(stat -c %a "$home")" "$home"
+        fi
+        return 0
+    fi
+    while true; do
+        ask number '要删除第几把？（回车返回）: ' && [[ -n $number ]] || return 0
+        [[ ! $number =~ ^[0-9]+$ ]] || (( 10#$number < 1 || 10#$number > count )) || break
+        printf '请输入 1 到 %s 之间的编号。\n' "$count"
+    done
+    number=$((10#$number))
+    IFS=$'\t' read -r _ kind fp comment <<< "$(sed -n "${number}p" <<< "$list")"
+    if [[ $user == "$auth_user" && $fp == "$auth_key" ]]; then
+        printf '这是你当前窗口登录用的密钥，不能删除。\n'; return 0
+    fi
+    if [[ $pa == no ]] && (( count == 1 )); then
+        printf 'SSH 已关闭密码登录，删掉最后这把公钥后 %s 就没法登录了，所以不能删。\n' "$user"; return 0
+    fi
+    confirm "确认删除第 $number 把（$kind $comment）？" || { printf '已取消。\n'; return 0; }
+    key_tool remove "$file" "$number" || die '删除失败，公钥没有改动。'
+    printf '已删除。用这把密钥的电脑以后就不能再登录 %s 了。\n' "$user"
+}
+password_login() {
+    local want=$1 expected=no current content backup='' user with_keys=''
+    [[ $want == off ]] || expected=yes
+    ssh_preflight pending
+    grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config ||
+        die 'SSH 主配置没有引入 /etc/ssh/sshd_config.d，无法安全修改，SSH 配置未改动。'
+    current=$(sshd_value passwordauthentication) || current=''
+    if [[ $current == "$expected" ]]; then
+        if [[ $want == off ]]; then printf 'SSH 密码登录本来就是关闭的。\n'; else printf 'SSH 密码登录本来就是允许的。\n'; fi
+        return 0
+    fi
+    if [[ $want == off ]]; then
+        # Never close password login unless someone can still get in with a key.
+        if [[ -n ${client_addr:-} ]]; then
+            session_auth
+            [[ $auth_method == publickey ]] || die "当前窗口不是用密钥登录的（${auth_method:-查不到登录方式}）。请先在菜单 11 里添加公钥，用密钥登录一次，再在那个窗口里关闭密码登录。"
+        else
+            for user in $(login_users); do
+                (( $(key_count "$user") == 0 )) || with_keys+="${with_keys:+、}$user"
+            done
+            [[ -n $with_keys ]] || die '服务器上没有任何用户配置了公钥，关闭密码登录后就没人能登录了。'
+            printf '当前不是 SSH 连接。这些用户有公钥，关闭后只能用它们登录：%s\n' "$with_keys"
+        fi
+        printf '关闭后所有用户（包括 root）都只能用密钥登录，猜密码的攻击会全部失效；已经连着的窗口不受影响。\n'
+        confirm '关闭 SSH 密码登录？' y || cancel
+        content=$'# Managed by vpsfw: SSH password login is off.\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n'
+    else
+        printf '打开后用户可以用密码登录 SSH，root 是否能用密码仍按原来的设置。\n'
+        confirm '打开 SSH 密码登录？' || cancel
+        content=$'# Managed by vpsfw: SSH password login is on.\nPasswordAuthentication yes\n'
+    fi
+    [[ ! -e $AUTH_CONF ]] || backup=$(cat "$AUTH_CONF")
+    # Files in sshd_config.d are read before the main config and the first value wins, so this one takes effect.
+    printf '%s' "$content" > "$AUTH_CONF.tmp" && chmod 644 "$AUTH_CONF.tmp" && mv -f "$AUTH_CONF.tmp" "$AUTH_CONF"
+    if ! sshd -t || ! systemctl reload ssh.service || [[ $(sshd_value passwordauthentication) != "$expected" ]]; then
+        if [[ -n $backup ]]; then printf '%s\n' "$backup" > "$AUTH_CONF"; else rm -f "$AUTH_CONF"; fi
+        sshd -t && systemctl reload ssh.service || true
+        die '修改没有生效，已恢复原来的设置。'
+    fi
+    if [[ $want == off ]]; then printf 'SSH 密码登录已关闭，现在只能用密钥登录。\n'
+    else printf 'SSH 密码登录已打开。\n'; fi
+}
+menu_auth() {
+    local pa choice
+    session_auth
+    auth_status "${auth_user:-${SUDO_USER:-root}}"
+    pa=$(sshd_value passwordauthentication) || pa=''
+    printf '\n  1) 修改密码\n  2) 管理公钥\n'
+    if [[ $pa == no ]]; then printf '  3) 打开密码登录\n\n'; else printf '  3) 关闭密码登录（只允许密钥登录）\n\n'; fi
+    while true; do
+        ask choice '请选择 [1-3]（回车返回）: ' && [[ -n $choice ]] || return 0
+        case $choice in
+            1) ask_login_user '修改哪个用户的密码？' || return 0; bash "$SELF" passwd "$REPLY" || true; return 0 ;;
+            2) ask_login_user '管理哪个用户的公钥？' || return 0; bash "$SELF" keys "$REPLY" || true; return 0 ;;
+            3)
+                if [[ $pa == no ]]; then bash "$SELF" password-login on || true
+                else bash "$SELF" password-login off || true; fi
+                return 0 ;;
+            *) printf '请输入 1、2 或 3。\n' ;;
+        esac
+    done
+}
 menu_unban() {
     local ip list
     list=" $(f2b_field 'Banned IP list') "
@@ -959,9 +1244,9 @@ ufw_switch() {
     fi
 }
 # Count terminal cells rather than characters: CJK characters take two cells,
-# so Chinese labels and two-digit numbers stay aligned. ● and · take one.
+# so Chinese labels and two-digit numbers stay aligned. ●, · and … take one.
 menu_width() {
-    local text=${1//[●·]/.} ascii
+    local text=${1//[●·…]/.} ascii
     ascii=${text//[! -~]/}
     REPLY=$(( ${#ascii} + (${#text} - ${#ascii}) * 2 ))
 }
@@ -1023,14 +1308,14 @@ LOGO
     menu_rule
     printf '\n'
     local labels=('初始化防护' '状态与规则' '添加放行端口' '删除放行端口' '替换放行端口' '查看端口监听'
-                  '防火墙开关' '修改 SSH 端口' 'Fail2ban 管理' 'SSH 登录记录')
+                  '防火墙开关' '修改 SSH 端口' 'Fail2ban 管理' 'SSH 登录记录' 'SSH 登录方式')
     if (( wide )); then
         menu_pair '端口管理' '防护与 SSH'
         printf '\n'
         for ((i=0;i<6;i++)); do
             left=${labels[i]}
             menu_item "$((i+1))" "$left"
-            if (( i < 4 )); then
+            if (( i < 5 )); then
                 menu_width "$left"; padding=$((28 - 4 - REPLY))
                 # The first column already supplied the row indentation.
                 printf '%*s    %s%2s.%s %s' "$padding" '' "$cyan" "$((i+7))" "$reset" "${labels[i+6]}"
@@ -1039,7 +1324,7 @@ LOGO
         done
     else
         printf '  %s端口管理%s\n\n' "$dim" "$reset"
-        for ((i=0;i<10;i++)); do
+        for ((i=0;i<11;i++)); do
             if (( i == 6 )); then printf '\n  %s防护与 SSH%s\n\n' "$dim" "$reset"; fi
             menu_item "$((i+1))" "${labels[i]}"; printf '\n\n'
         done
@@ -1288,12 +1573,12 @@ menu() {
         [[ $columns =~ ^[0-9]+$ ]] || columns=80
         menu_draw "$fw" "$ban" "$current" "$columns"
         while true; do
-            ask choice '  请选择 [0-10]: ' || return 0
+            ask choice '  请选择 [0-11]: ' || return 0
             case "$choice" in
                 0|q|Q) return 0 ;;
-                [1-9]|10) break ;;
+                [1-9]|1[01]) break ;;
                 '') ;;
-                *) printf '  没有这个选项，请输入 0 到 10。\n' ;;
+                *) printf '  没有这个选项，请输入 0 到 11。\n' ;;
             esac
         done
         case "$choice" in
@@ -1313,6 +1598,7 @@ menu() {
                     if confirm '按当前 SSH 端口重新同步 Fail2ban？' y; then bash "$SELF" sync || true; fi
                 fi ;;
             10) menu_logins ;;
+            11) menu_auth ;;
         esac
         ask reply $'\n按回车返回菜单……' || return 0
     done
@@ -1327,7 +1613,7 @@ if (( $# == 0 )); then mode=menu; fi
 case "${1:-}" in
     install) shift ;;
     help) usage; exit 0 ;;
-    status|ssh|ports|firewall|sync|logins)
+    status|ssh|ports|firewall|sync|logins|passwd|keys|password-login)
         mode=$1; shift; dispatch_args=("$@"); set -- ;;
 esac
 while (( $# )); do
@@ -1341,17 +1627,17 @@ while (( $# )); do
 done
 trap 'printf "\n操作中断：上面这一步执行失败（脚本第 %s 行），部分配置可能已经修改。\n请保留当前 SSH 连接，用菜单 2 查看状态后再重试。\n" "$LINENO" >&2' ERR
 [[ $EUID -eq 0 ]] || die '需要 root 权限，请用 sudo vpsfw 运行。'
-if [[ $mode == install || $mode == menu || $mode == ssh || $mode == firewall ]]; then
+if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login)$ ]]; then
     [[ -t 0 ]] || die '请下载脚本后在交互终端运行，不要通过管道运行。'
 fi
 . /etc/os-release
 [[ ${ID:-} == debian && ${VERSION_ID:-} == 13 ]] || die '此脚本针对 Debian 13。'
 [[ -d /run/systemd/system ]] || die '需要使用 systemd 的系统。'
 
-session_port='' server_addr=''
+session_port='' server_addr='' client_addr='' client_port=''
 connection=$(ssh_connection)
 if [[ -n $connection ]]; then
-    read -r _ _ server_addr session_port <<< "$connection"
+    read -r client_addr client_port server_addr session_port <<< "$connection"
     valid_port "$session_port" || die '无法正确解析当前 SSH 端口。'
 fi
 if [[ $mode != menu && $mode != status && $mode != logins ]]; then
@@ -1367,6 +1653,15 @@ case "$mode" in
         [[ ${#dispatch_args[@]} -le 1 && $days =~ ^[0-9]+$ ]] && (( 10#$days >= 1 && 10#$days <= 90 )) || die '用法：logins [天数，1 到 90]'
         show_logins "$((10#$days))"; exit 0 ;;
     ports) ports_command "${dispatch_args[@]}"; exit 0 ;;
+    passwd|keys)
+        (( ${#dispatch_args[@]} <= 1 )) || die "用法：$mode [用户]"
+        session_auth
+        if [[ $mode == passwd ]]; then change_password "${dispatch_args[0]:-${auth_user:-${SUDO_USER:-root}}}"
+        else manage_keys "${dispatch_args[0]:-${auth_user:-${SUDO_USER:-root}}}"; fi
+        exit 0 ;;
+    password-login)
+        [[ ${#dispatch_args[@]} == 1 && ( ${dispatch_args[0]} == on || ${dispatch_args[0]} == off ) ]] || die '用法：password-login on|off'
+        password_login "${dispatch_args[0]}"; exit 0 ;;
     firewall)
         [[ ${#dispatch_args[@]} == 1 && ( ${dispatch_args[0]} == enable || ${dispatch_args[0]} == disable ) ]] || die '用法：firewall enable|disable'
         ufw_switch "${dispatch_args[0]}"; exit 0 ;;
