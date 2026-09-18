@@ -66,6 +66,7 @@ bash vpsfw.sh
 9. 查看 Fail2ban 保护端口、封禁条件和封禁名单，可直接解封 IP；端口与 SSH 不一致或没在运行时提示同步
 10. 查看最近几天的 SSH 登录记录：成功登录（时间、用户、来源 IP、密钥还是密码），失败尝试按来源 IP 汇总（次数、最近一次、试过的用户名、是否已被封禁），以及 Fail2ban 的封禁次数
 11. SSH 登录方式：修改登录密码、管理公钥、关闭或打开密码登录，详见下文
+12. 禁止或恢复别人 ping 这台服务器（IPv4 和 IPv6）；只改 UFW 里放行 ping 的那两行，其他 ICMP 和服务器自己 ping 别人都不受影响
 
 ## SSH 端口迁移
 
@@ -124,6 +125,10 @@ bash vpsfw.sh logins 7
 bash vpsfw.sh passwd alice
 bash vpsfw.sh keys alice
 bash vpsfw.sh password-login off
+
+# 禁止 / 恢复别人 ping 这台服务器
+bash vpsfw.sh ping off
+bash vpsfw.sh ping on
 ```
 
 省略协议时默认 **TCP**；需要 TCP 和 UDP 时显式选 `both`，大小写均可。来源默认 `any`，也可填 IPv4、IPv6 或 CIDR 网段。多个端口用逗号分隔，范围用冒号或连字符，例如 `443,8000:8010` 或 `443, 8000-8010`。每项单独建规则，范围须整体删除。

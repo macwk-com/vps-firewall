@@ -44,6 +44,7 @@ VPS Firewall — Debian 13 服务器安全与端口管理
   vpsfw passwd [用户]                # 修改登录密码
   vpsfw keys [用户]                  # 查看、添加、删除 SSH 公钥
   vpsfw password-login off|on        # 关闭或打开 SSH 密码登录
+  vpsfw ping off|on                  # 禁止或恢复别人 ping 这台服务器
   vpsfw firewall enable|disable
   vpsfw help                         # 显示本帮助
 
@@ -635,6 +636,15 @@ show_status() {
     status_row 防火墙 "$fw" "$fw_color" "$fw_note"
     status_row SSH "${ssh:-未知}" "$ssh_color" "$ssh_note"
     status_row Fail2ban "$f2b_state" "$f2b_color" "$f2b_note"
+    if command -v ufw >/dev/null; then
+        ping_state
+        case $REPLY in
+            blocked) status_row Ping '● 已禁止' "$c_ok" '别人 ping 不通这台服务器' ;;
+            allowed) status_row Ping '允许' '' '需要时可在菜单 12 禁止' ;;
+            mixed) status_row Ping '● 部分禁止' "$c_warn" 'IPv4 和 IPv6 的设置不一致' ;;
+            *) status_row Ping '未知' "$c_warn" 'UFW 的 ping 规则被手动改过' ;;
+        esac
+    fi
 
     if command -v ufw >/dev/null; then
         load_rules
@@ -817,6 +827,67 @@ menu_logins() {
         printf '请输入 1 到 90 之间的天数。\n'
     done
     show_logins "$((10#$days))"
+}
+# ── Ping: only the two lines that accept echo requests change; other ICMP (errors, IPv6 neighbour
+# discovery) keeps working, and so does pinging out from this server. ──
+PING_V4='-A ufw-before-input -p icmp --icmp-type echo-request -j'
+PING_V6='-A ufw6-before-input -p icmpv6 --icmpv6-type echo-request -j'
+# ACCEPT or DROP from a rules file, or nothing when the line is missing, duplicated or edited.
+ping_rule() {
+    local count
+    count=$(grep -c -F -x -e "$2 ACCEPT" -e "$2 DROP" "$1" 2>/dev/null || true)
+    [[ $count == 1 ]] || return 0
+    grep -F -x -e "$2 ACCEPT" -e "$2 DROP" "$1" | awk '{print $NF}'
+}
+# Sets REPLY to allowed, blocked, mixed or unknown.
+ping_state() {
+    local v4 v6
+    v4=$(ping_rule /etc/ufw/before.rules "$PING_V4"); v6=$(ping_rule /etc/ufw/before6.rules "$PING_V6")
+    if [[ $v4 == ACCEPT && $v6 == ACCEPT ]]; then REPLY=allowed
+    elif [[ $v4 == DROP && $v6 == DROP ]]; then REPLY=blocked
+    elif [[ -n $v4 && -n $v6 ]]; then REPLY=mixed
+    else REPLY=unknown; fi
+}
+ping_switch() {
+    local want=$1 target=DROP expected=blocked
+    command -v ufw >/dev/null || die '还没有初始化：请先在菜单选 1，或运行 vpsfw install。'
+    [[ $want == off ]] || { target=ACCEPT; expected=allowed; }
+    ping_state
+    [[ $REPLY != unknown ]] || die 'UFW 的 ping 规则被手动改过（/etc/ufw/before.rules 或 before6.rules），无法自动修改。'
+    if [[ $REPLY == "$expected" ]]; then
+        if [[ $want == off ]]; then printf '服务器本来就不响应 ping。\n'; else printf '服务器本来就响应 ping。\n'; fi
+        return 0
+    fi
+    if [[ $want == off ]]; then
+        printf '禁止后，别人 ping 这台服务器会一直超时（IPv4 和 IPv6 都一样）。网站、SSH 等服务照常，服务器自己 ping 别人也不受影响。\n'
+        printf '注意：服务商后台或监控工具如果靠 ping 判断在线，可能会显示离线；禁止 ping 只是少暴露一点，端口扫描照样能发现这台服务器。\n'
+        confirm '禁止 ping？' y || cancel
+    else
+        printf '恢复后，别人可以 ping 通这台服务器。\n'
+        confirm '允许 ping？' y || cancel
+    fi
+    backup_ufw
+    sed -i "s#^$PING_V4 \(ACCEPT\|DROP\)\$#$PING_V4 $target#" /etc/ufw/before.rules
+    sed -i "s#^$PING_V6 \(ACCEPT\|DROP\)\$#$PING_V6 $target#" /etc/ufw/before6.rules
+    ping_state
+    if [[ $REPLY != "$expected" ]] || { [[ $(ufw status) == 'Status: active'* ]] && ! ufw reload >/dev/null; }; then
+        cp -a "$backup_dir/ufw/before.rules" "$backup_dir/ufw/before6.rules" /etc/ufw/
+        ufw reload >/dev/null 2>&1 || true
+        die '修改没有生效，已恢复原来的设置。'
+    fi
+    prune_backups
+    if [[ $want == off ]]; then printf '已禁止 ping。\n'; else printf '已恢复响应 ping。\n'; fi
+    [[ $(ufw status) == 'Status: active'* ]] || printf '防火墙当前未启用，设置已保存，启用后才生效（菜单 7）。\n'
+}
+menu_ping() {
+    command -v ufw >/dev/null || { printf '\n还没有初始化，请先选择 1。\n'; return 0; }
+    ping_state
+    case $REPLY in
+        allowed) printf '\n现在：服务器响应 ping。\n'; bash "$SELF" ping off || true ;;
+        blocked) printf '\n现在：服务器不响应 ping。\n'; bash "$SELF" ping on || true ;;
+        mixed) printf '\n现在：IPv4 和 IPv6 的设置不一致。\n'; bash "$SELF" ping off || true ;;
+        *) printf '\nUFW 的 ping 规则被手动改过，无法自动修改。\n' ;;
+    esac
 }
 # ── SSH login methods: account passwords, public keys and whether password login is allowed. ──
 AUTH_CONF=/etc/ssh/sshd_config.d/00-vpsfw-auth.conf
@@ -1308,14 +1379,14 @@ LOGO
     menu_rule
     printf '\n'
     local labels=('初始化防护' '状态与规则' '添加放行端口' '删除放行端口' '替换放行端口' '查看端口监听'
-                  '防火墙开关' '修改 SSH 端口' 'Fail2ban 管理' 'SSH 登录记录' 'SSH 登录方式')
+                  '防火墙开关' '修改 SSH 端口' 'Fail2ban 管理' 'SSH 登录记录' 'SSH 登录方式' 'Ping 开关')
     if (( wide )); then
         menu_pair '端口管理' '防护与 SSH'
         printf '\n'
         for ((i=0;i<6;i++)); do
             left=${labels[i]}
             menu_item "$((i+1))" "$left"
-            if (( i < 5 )); then
+            if (( i < 6 )); then
                 menu_width "$left"; padding=$((28 - 4 - REPLY))
                 # The first column already supplied the row indentation.
                 printf '%*s    %s%2s.%s %s' "$padding" '' "$cyan" "$((i+7))" "$reset" "${labels[i+6]}"
@@ -1324,7 +1395,7 @@ LOGO
         done
     else
         printf '  %s端口管理%s\n\n' "$dim" "$reset"
-        for ((i=0;i<11;i++)); do
+        for ((i=0;i<12;i++)); do
             if (( i == 6 )); then printf '\n  %s防护与 SSH%s\n\n' "$dim" "$reset"; fi
             menu_item "$((i+1))" "${labels[i]}"; printf '\n\n'
         done
@@ -1573,12 +1644,12 @@ menu() {
         [[ $columns =~ ^[0-9]+$ ]] || columns=80
         menu_draw "$fw" "$ban" "$current" "$columns"
         while true; do
-            ask choice '  请选择 [0-11]: ' || return 0
+            ask choice '  请选择 [0-12]: ' || return 0
             case "$choice" in
                 0|q|Q) return 0 ;;
-                [1-9]|1[01]) break ;;
+                [1-9]|1[0-2]) break ;;
                 '') ;;
-                *) printf '  没有这个选项，请输入 0 到 11。\n' ;;
+                *) printf '  没有这个选项，请输入 0 到 12。\n' ;;
             esac
         done
         case "$choice" in
@@ -1599,6 +1670,7 @@ menu() {
                 fi ;;
             10) menu_logins ;;
             11) menu_auth ;;
+            12) menu_ping ;;
         esac
         ask reply $'\n按回车返回菜单……' || return 0
     done
@@ -1613,7 +1685,7 @@ if (( $# == 0 )); then mode=menu; fi
 case "${1:-}" in
     install) shift ;;
     help) usage; exit 0 ;;
-    status|ssh|ports|firewall|sync|logins|passwd|keys|password-login)
+    status|ssh|ports|firewall|sync|logins|passwd|keys|password-login|ping)
         mode=$1; shift; dispatch_args=("$@"); set -- ;;
 esac
 while (( $# )); do
@@ -1627,7 +1699,7 @@ while (( $# )); do
 done
 trap 'printf "\n操作中断：上面这一步执行失败（脚本第 %s 行），部分配置可能已经修改。\n请保留当前 SSH 连接，用菜单 2 查看状态后再重试。\n" "$LINENO" >&2' ERR
 [[ $EUID -eq 0 ]] || die '需要 root 权限，请用 sudo vpsfw 运行。'
-if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login)$ ]]; then
+if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login|ping)$ ]]; then
     [[ -t 0 ]] || die '请下载脚本后在交互终端运行，不要通过管道运行。'
 fi
 . /etc/os-release
@@ -1659,6 +1731,9 @@ case "$mode" in
         if [[ $mode == passwd ]]; then change_password "${dispatch_args[0]:-${auth_user:-${SUDO_USER:-root}}}"
         else manage_keys "${dispatch_args[0]:-${auth_user:-${SUDO_USER:-root}}}"; fi
         exit 0 ;;
+    ping)
+        [[ ${#dispatch_args[@]} == 1 && ( ${dispatch_args[0]} == on || ${dispatch_args[0]} == off ) ]] || die '用法：ping off|on'
+        ping_switch "${dispatch_args[0]}"; exit 0 ;;
     password-login)
         [[ ${#dispatch_args[@]} == 1 && ( ${dispatch_args[0]} == on || ${dispatch_args[0]} == off ) ]] || die '用法：password-login on|off'
         password_login "${dispatch_args[0]}"; exit 0 ;;
