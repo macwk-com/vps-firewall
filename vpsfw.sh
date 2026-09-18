@@ -545,38 +545,101 @@ ufw_switch() {
         ufw disable
     fi
 }
-menu() {
-    local choice values proto old new reply rc source
-    local cyan='' purple='' reset='' bold=''
-    if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
-        cyan=$'\033[36m'; purple=$'\033[35m'; reset=$'\033[0m'; bold=$'\033[1m'
+# Menu labels use ASCII and three-byte CJK characters. Count terminal cells,
+# not UTF-8 bytes, so Chinese labels and two-digit numbers stay aligned.
+menu_width() {
+    local text=$1 ascii
+    ascii=${text//[! -~]/}
+    REPLY=$(( ${#ascii} + (${#text} - ${#ascii}) / 3 * 2 ))
+}
+menu_pair() {
+    local left=$1 right=$2 padding
+    menu_width "$left"
+    padding=$((28 - REPLY))
+    (( padding >= 0 )) || padding=0
+    printf '  %s%*s    %s\n' "$left" "$padding" '' "$right"
+}
+menu_item() {
+    printf '  %s%2s.%s %s' "$cyan" "$1" "$reset" "$2"
+}
+menu_rule() {
+    local line
+    printf -v line '%*s' "$menu_span" ''
+    printf '  %s%s%s\n' "$purple" "${line// /─}" "$reset"
+}
+menu_draw() {
+    local fw=$1 ban=$2 current=$3 columns=$4
+    local cyan='' purple='' reset='' bold='' dim=''
+    if [[ -t 1 && ${TERM:-dumb} != dumb && ${NO_COLOR+x} != x ]]; then
+        cyan=$'\033[36m'; purple=$'\033[34m'; reset=$'\033[0m'
+        bold=$'\033[1m'; dim=$'\033[90m'
     fi
+    local menu_span=60 wide=1 i left right padding
+    if (( columns < 64 )); then
+        wide=0; menu_span=$((columns - 4))
+        (( menu_span >= 24 )) || menu_span=24
+    fi
+    printf '\n  %sV P S F W%s\n' "$cyan$bold" "$reset"
+    printf '  %s服务器端口与 SSH 管理%s\n\n' "$dim" "$reset"
+    menu_rule
+    if (( wide )); then
+        menu_pair "UFW       $fw" "Fail2ban  $ban"
+        menu_pair "SSH       $current" "当前连接  ${session_port:-控制台}"
+    else
+        printf '  UFW       %s\n  Fail2ban  %s\n  SSH       %s\n  当前连接  %s\n' "$fw" "$ban" "$current" "${session_port:-控制台}"
+    fi
+    menu_rule
+    printf '\n'
+    local labels=('初始化防护' '状态与规则' '添加放行端口' '删除放行端口' '替换放行端口' '查看端口监听'
+                  '防火墙开关' '修改 SSH 端口' '确认 SSH 迁移' '回退 SSH 迁移' 'Fail2ban 管理' '查看配置备份')
+    if (( wide )); then
+        menu_pair '端口管理' '防护与 SSH'
+        printf '\n'
+        for ((i=0;i<6;i++)); do
+            left=${labels[i]}; right=${labels[i+6]}
+            menu_width "$left"; padding=$((28 - 4 - REPLY))
+            menu_item "$((i+1))" "$left"
+            printf '%*s    ' "$padding" ''
+            # The first column already supplied the row indentation.
+            printf '%s%2s.%s %s\n' "$cyan" "$((i+7))" "$reset" "$right"
+        done
+    else
+        printf '  %s端口管理%s\n\n' "$dim" "$reset"
+        for ((i=0;i<12;i++)); do
+            if (( i == 6 )); then printf '\n  %s防护与 SSH%s\n\n' "$dim" "$reset"; fi
+            menu_item "$((i+1))" "${labels[i]}"; printf '\n'
+        done
+    fi
+    printf '\n'; menu_rule
+    menu_item 0 '退出'; printf '\n'; menu_rule
+    if [[ -f $PENDING_FILE ]]; then
+        printf '\n  %sSSH 迁移待确认%s\n  请从新端口登录，再选择 9。\n' "$cyan" "$reset"
+    fi
+    printf '\n'
+}
+menu() {
+    local choice values proto old new reply rc source columns
     while true; do
-        if [[ ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi
-        printf '%s' "$cyan"
-        printf '  __   ______  ____     ____  _   _ ___ _____ _     ____  \n'
-        printf '  \\ \\ / /  _ \\/ ___|   / ___|| | | |_ _| ____| |   |  _ \\ \n'
-        printf '   \\ V /| |_) \\___ \\   \\___ \\| |_| || ||  _| | |   | | | |\n'
-        printf '    \\_/ | .__/|____/   |____/ \\___/|___|_____|_____|____/ \n'
-        printf '        |_|%s\n' "$reset"
-        printf '\n%s  VPS Firewall  ·  Debian 13%s\n' "$bold" "$reset"
-        printf '%s  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$purple" "$reset"
-        local fw='未安装' ban='未安装' current='未知'
-        if command -v ufw >/dev/null; then fw=$(ufw status | sed -n '1p'); fi
-        if command -v fail2ban-client >/dev/null; then ban=$(systemctl is-active fail2ban 2>/dev/null) || true; fi
+        if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi
+        local fw='未安装' ban='未安装' current='未知' raw
+        if command -v ufw >/dev/null; then
+            raw=$(ufw status 2>/dev/null) || raw=''
+            case "$raw" in
+                'Status: active'*) fw='已启用' ;;
+                'Status: inactive'*) fw='未启用' ;;
+                *) fw='状态异常' ;;
+            esac
+        fi
+        if command -v fail2ban-client >/dev/null; then
+            if fail2ban-client status sshd >/dev/null 2>&1; then ban='保护中'; else ban='未就绪'; fi
+        fi
         current=$(ssh_ports 2>/dev/null) || current='未知'
-        printf '  UFW  ▸ %s    Fail2ban ▸ %s\n' "$fw" "$ban"
-        printf '  SSH  ▸ %s    当前连接 ▸ %s\n' "$current" "${session_port:-控制台}"
-        [[ ! -f $PENDING_FILE ]] || printf '  ● SSH 迁移待确认：请通过新端口登录后选择 9\n'
-        printf '%s  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$purple" "$reset"
-        printf '\n  %s1.%s 初始化 UFW + Fail2ban     %s7.%s 启用 / 停用 UFW\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '  %s2.%s 查看状态和全部规则       %s8.%s 修改 SSH 端口（三项同步）\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '  %s3.%s 添加放行端口             %s9.%s 确认迁移，关闭旧 SSH 入口\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '  %s4.%s 删除放行端口            %s10.%s 回退待确认的 SSH 迁移\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '  %s5.%s 替换放行端口            %s11.%s Fail2ban 状态 / 同步端口\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '  %s6.%s 查看监听端口及程序      %s12.%s 查看备份位置\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '\n  %s0.%s 退出\n\n' "$cyan" "$reset"
-        read -r -p '请选择: ' choice || return 0
+        [[ -n $current ]] || current='未知'
+        if (( ${#current} > 18 )); then current="${current:0:15}..."; fi
+        columns=$(tput cols 2>/dev/null) || columns=${COLUMNS:-80}
+        [[ $columns =~ ^[0-9]+$ ]] || columns=80
+        menu_draw "$fw" "$ban" "$current" "$columns"
+        read -r -p '  请选择 [0-12]: ' choice || return 0
         rc=0
         case "$choice" in
             0) return 0 ;;
