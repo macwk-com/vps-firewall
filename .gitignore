@@ -5,3 +5,7 @@
 .env
 .env.*
 backups/
+
+__pycache__/
+
+*.pyc

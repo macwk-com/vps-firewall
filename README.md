@@ -111,6 +111,8 @@ bash vpsfw.sh sync
 
 ## 备份及恢复入口
 
+每次操作成功后自动清理旧备份，只保留最近一次。SSH 迁移尚未确认时，额外保留迁移前的原始备份；失败操作不会触发清理。Git 历史不受影响。
+
 原配置存放在 `/var/backups/vps-security.*` 或 `/var/backups/vps-security-ssh.*`，具体路径在每次操作时显示。迁移中的状态存放在 `/var/lib/vps-security/ssh-pending`。备份权限仅限 root，可能包含敏感配置，请勿公开分享。
 
 需要紧急恢复访问时，在保留的 SSH 会话或服务商控制台执行：

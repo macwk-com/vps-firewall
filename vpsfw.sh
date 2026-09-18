@@ -126,6 +126,28 @@ backup_ufw() {
     printf '原 UFW 配置备份：%s\n' "$backup_dir"
 }
 
+# Keep the last successful operation's backup; an unconfirmed SSH migration pins its original backup.
+prune_backups() {
+    python3 - "${backup_dir:-}" /var/backups /var/lib/vps-security/ssh-pending <<'PYBACKUP' || printf '旧备份清理失败，已保留，请检查 /var/backups。\n' >&2
+import sys,pathlib,re,shutil
+current,root,pending=map(pathlib.Path,sys.argv[1:])
+if not current.is_dir() or current.parent!=root:
+    raise SystemExit('没有有效的本次备份，跳过清理')
+keep={current}
+if pending.exists():
+    lines=pending.read_text().splitlines()
+    if len(lines)!=3: raise SystemExit('待确认迁移状态异常，不清理备份')
+    original=pathlib.Path(lines[0])
+    if not original.is_dir(): raise SystemExit('迁移原备份缺失，不清理备份')
+    keep.add(original)
+for p in root.iterdir():
+    if p in keep or p.is_symlink() or not p.is_dir(): continue
+    if not re.fullmatch(r'vps-security(?:-ssh)?\.[A-Za-z0-9]{8}',p.name): continue
+    if (p/'ssh-files.json').is_file() or ((p/'ufw').is_dir() and (p/'ufw-default').is_file()):
+        shutil.rmtree(p)
+PYBACKUP
+}
+
 # SSH changes are transactions. Keep the previous listener until a new-port session confirms.
 STATE_DIR=/var/lib/vps-security
 PENDING_FILE=$STATE_DIR/ssh-pending
@@ -351,6 +373,7 @@ ssh_change() {
     printf '%s\n%s\n%s\n' "$backup_dir" "$old" "$new" > "$PENDING_FILE.tmp"
     mv "$PENDING_FILE.tmp" "$PENDING_FILE"
     end_transaction
+    prune_backups
     printf '\n新端口 %s 已监听；旧入口 %s 保留，Fail2ban 同时保护两者。\n' "$new" "$old"
     printf '请新开终端用新端口登录，然后在新会话运行本脚本，选择「确认迁移」。\n'
 }
@@ -375,6 +398,7 @@ ssh_finish() {
             ufw --force delete allow "$p/tcp" comment 'SSH'
         fi
     done
+    prune_backups
     printf '迁移完成：SSH 和 Fail2ban 使用 %s；旧 SSH 监听已关闭。\n' "$pending_new"
     printf '其他未标记的旧 UFW 放行规则不会删除，可在规则列表中检查。\n'
 }
@@ -385,6 +409,8 @@ ssh_rollback() {
     [[ $answer == yes ]] || die '已取消。'
     restore_ssh_backup "$pending_backup"
     rm -f "$PENDING_FILE"
+    backup_dir=$pending_backup
+    prune_backups
     printf '已恢复迁移前的 SSH 和 Fail2ban 配置。\n'
 }
 show_status() {
@@ -435,6 +461,7 @@ ports_command() {
     done
     load_rules
     list_realm
+    prune_backups
     printf '仅修改 UFW，不修改 Realm 配置；其他宽泛规则仍可能允许该端口。\n'
 }
 ufw_switch() {
@@ -602,6 +629,7 @@ case "$mode" in
         effective=$(fail2ban-client get sshd action nftables-multiport port)
         [[ $effective == "$current" ]] || die '其他配置覆盖了 Fail2ban 端口，已中止。'
         end_transaction
+        prune_backups
         printf 'Fail2ban 已同步 SSH 端口：%s\n' "$current"
         exit 0 ;;
 esac
@@ -638,6 +666,7 @@ if [[ $mode == realm ]]; then
     esac
     load_rules
     list_realm
+    prune_backups
     printf '\n仅更新了 UFW 规则；Realm、客户端和云安全组需要对应配置。\n'
     printf '若有其他宽泛放行规则，删除这里的规则不保证端口完全关闭。\n'
     exit 0
@@ -749,6 +778,7 @@ printf '\n===== Fail2ban SSH 状态 =====\n'
 fail2ban-client status sshd
 printf '\n===== 实际启用的封禁动作 =====\n'
 fail2ban-client get sshd actions
+prune_backups
 printf '\n配置完成。备份：%s\n' "$backup_dir"
 printf '请保留当前窗口，新开 SSH 连接测试登录，再测试 Realm 的 TCP/UDP 连接。\n'
 printf 'Realm 必须实际监听 %s，客户端也要使用该端口；服务商安全组需同步放行。\n' "$realm_port"
