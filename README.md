@@ -146,5 +146,3 @@ fail2ban-client set sshd unbanip 你的公网IP
 ## 验证范围
 
 已完成 Bash 语法检查、隔离文件下的真实 OpenSSH 配置检查，以及端口管理、双端口迁移、会话确认、重载失败回退的模拟测试。另在带 systemd 的 Debian 13 容器里，通过真实 SSH 登录（root 和 sudo 普通用户）跑通了空规则初始化、重复初始化、菜单增删改端口、SSH 迁移确认与回退、防火墙开关。尚未在真实 VPS 上验证。
-
-回归测试：`python3 -m unittest discover -s tests -v`。测试使用临时文件和命令替身，不操作宿主机防火墙。
