@@ -64,6 +64,7 @@ bash vpsfw.sh
 7. 显示防火墙当前状态，启用或停用 UFW
 8. 修改 SSH 端口，同步 SSH / UFW / Fail2ban；迁移进行中时在这里确认或回退
 9. 查看 Fail2ban 保护端口、封禁条件和封禁名单，可直接解封 IP；端口与 SSH 不一致或没在运行时提示同步
+10. 查看最近几天的 SSH 登录记录：成功登录（时间、用户、来源 IP、密钥还是密码），失败尝试按来源 IP 汇总（次数、最近一次、试过的用户名、是否已被封禁），以及 Fail2ban 的封禁次数
 
 ## SSH 端口迁移
 
@@ -103,9 +104,10 @@ bash vpsfw.sh ssh change 38217
 bash vpsfw.sh ssh finish
 bash vpsfw.sh ssh rollback
 
-# 查看状态 / 同步 Fail2ban
+# 查看状态 / 同步 Fail2ban / 最近 7 天的 SSH 登录记录
 bash vpsfw.sh status
 bash vpsfw.sh sync
+bash vpsfw.sh logins 7
 ```
 
 省略协议时默认 **TCP**；需要 TCP 和 UDP 时显式选 `both`，大小写均可。来源默认 `any`，也可填 IPv4、IPv6 或 CIDR 网段。多个端口用逗号分隔，范围用冒号或连字符，例如 `443,8000:8010` 或 `443, 8000-8010`。每项单独建规则，范围须整体删除。

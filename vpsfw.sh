@@ -40,6 +40,7 @@ VPS Firewall — Debian 13 服务器安全与端口管理
   vpsfw ssh finish                   # 新端口登录后关闭旧入口
   vpsfw ssh rollback
   vpsfw sync                         # 同步 Fail2ban SSH 端口
+  vpsfw logins 7                     # 最近 7 天的 SSH 登录记录
   vpsfw firewall enable|disable
   vpsfw help                         # 显示本帮助
 
@@ -691,6 +692,124 @@ show_f2b() {
     section '正在封禁的 IP'
     print_banned
 }
+# SSH logins of the last N days from the journal: successes first, then failures per source IP,
+# then how often Fail2ban banned. Read only.
+show_logins() {
+    local days=${1:-1} banned=''
+    set_colors
+    command -v journalctl >/dev/null || { printf '\n系统没有 journalctl，读不到 SSH 登录记录。\n'; return 0; }
+    if command -v fail2ban-client >/dev/null; then
+        banned=$(fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p') || banned=''
+    fi
+    python3 - "$days" "$banned" "$c_ok" "$c_warn" "$c_err" "$c_dim" "$c_head" "$c_off" <<'PY'
+import json, re, subprocess, sys, time, unicodedata
+from collections import Counter, defaultdict
+days = int(sys.argv[1]); banned = set(sys.argv[2].split())
+ok, warn, err, dim, head, off = sys.argv[3:9]
+since = time.time() - days * 86400
+
+def width(text):
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in text)
+def pad(text, cells):
+    return text + ' ' * max(cells - width(text), 1)
+def stamp(seconds):
+    return time.strftime('%m-%d %H:%M', time.localtime(seconds))
+def section(title):
+    print(f'\n  {head}{title}{off}')
+
+journal = subprocess.run(['journalctl', '-u', 'ssh.service', '-u', 'sshd.service', '--since', f'{days} days ago',
+                          '-o', 'json', '--no-pager'], capture_output=True, text=True).stdout
+accepted = re.compile(r'Accepted (\S+) for (\S+) from (\S+) port')
+failed = re.compile(r'Failed \S+ for (?:invalid user )?(.*?) from (\S+) port')
+invalid = re.compile(r'Invalid user (.*?) from (\S+) port')
+closed = re.compile(r'(?:Connection closed|Disconnected) by (?:authenticating|invalid) user (.*?) (\S+) port \d+ \[preauth\]')
+# OpenSSH 9.8+ refuses new connections from a source that keeps failing (PerSourcePenalties).
+penalty = re.compile(r'drop connection #\d+ from \[(.+?)\]:\d+ on .* penalty: ')
+dropped = Counter()
+# One sshd-session process is one connection; group its lines so one attempt is counted once.
+connections = defaultdict(lambda: {'fails': 0, 'rejected': False})
+successes = []
+for line in journal.splitlines():
+    try: entry = json.loads(line)
+    except ValueError: continue
+    message = entry.get('MESSAGE')
+    if isinstance(message, list): message = bytes(message).decode('utf-8', 'replace')
+    if not isinstance(message, str): continue
+    when = int(entry.get('__REALTIME_TIMESTAMP', 0)) / 1e6
+    if m := penalty.search(message):
+        dropped[m.group(1)] += 1
+        continue
+    conn = connections[(entry.get('_BOOT_ID'), entry.get('_PID'))]
+    if m := accepted.search(message):
+        method, user, ip = m.groups()
+        successes.append((when, user, ip, {'publickey': '密钥', 'password': '密码'}.get(method, method)))
+        conn['accepted'] = True
+        continue
+    for pattern in (failed, invalid, closed):
+        if m := pattern.search(message):
+            user, ip = m.groups()
+            conn.update(ip=ip, user=user, last=when)
+            if pattern is failed: conn['fails'] += 1
+            else: conn['rejected'] = True
+            break
+
+attempts, last, users = Counter(), {}, defaultdict(Counter)
+for conn in connections.values():
+    if conn.get('accepted') or 'ip' not in conn: continue
+    count = conn['fails'] or 1
+    attempts[conn['ip']] += count
+    users[conn['ip']][conn['user']] += count
+    last[conn['ip']] = max(last.get(conn['ip'], 0), conn['last'])
+
+# The IP column is only as wide as the longest address shown.
+shown = [ip for _, _, ip, _ in successes[-20:]] + [ip for ip, _ in attempts.most_common(10)]
+ip_cells = max([width('来源 IP')] + [width(ip) for ip in shown]) + 3
+print(f'\n  {head}SSH 登录记录 · 最近 {days} 天{off}')
+section(f'成功登录（{len(successes)} 次）')
+if successes:
+    print(f"  {dim}{pad('时间', 14)}{pad('用户', 10)}{pad('来源 IP', ip_cells)}方式{off}")
+    for when, user, ip, method in sorted(successes, reverse=True)[:20]:
+        print(f'  {pad(stamp(when), 14)}{pad(user, 10)}{pad(ip, ip_cells)}{method}')
+    if len(successes) > 20: print(f'  {dim}……只显示最近 20 次{off}')
+else:
+    print(f'  {dim}无{off}')
+
+section(f'失败尝试（{sum(attempts.values())} 次，来自 {len(attempts)} 个 IP）')
+if attempts:
+    print(f"  {dim}{pad('来源 IP', ip_cells)}{pad('次数', 7)}{pad('最近一次', 14)}{pad('试过的用户名', 26)}状态{off}")
+    for ip, count in attempts.most_common(10):
+        names = [name for name, _ in users[ip].most_common()]
+        tried = '、'.join(names[:3]) + ('…' if len(names) > 3 else '')
+        status = f'{ok}● 已封禁{off}' if ip in banned else ''
+        print(f'  {pad(ip, ip_cells)}{pad(str(count), 7)}{pad(stamp(last[ip]), 14)}{pad(tried, 26)}{status}')
+    if len(attempts) > 10: print(f'  {dim}……按次数只显示前 10 个 IP{off}')
+else:
+    print(f'  {dim}无{off}')
+if dropped:
+    print(f'  {dim}另外 sshd 自带的防护直接拒绝了 {sum(dropped.values())} 次连接（{len(dropped)} 个 IP 失败太频繁），这些连接没到登录这一步。{off}')
+
+bans = []
+try:
+    with open('/var/log/fail2ban.log', errors='replace') as log:
+        for line in log:
+            m = re.match(r'(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d).*\[sshd\] Ban (\S+)', line)
+            if m and time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')) >= since:
+                bans.append(m.group(2))
+except OSError:
+    pass
+print(f'\n  {dim}Fail2ban 这段时间封禁了 {len(bans)} 次（{len(set(bans))} 个 IP），目前仍在封禁 {len(banned)} 个。{off}\n')
+PY
+}
+menu_logins() {
+    local days
+    while true; do
+        ask days '查看最近几天的记录？[回车 = 1]: ' || return 0
+        days=${days:-1}
+        [[ ! $days =~ ^[0-9]+$ ]] || (( 10#$days < 1 || 10#$days > 90 )) || break
+        printf '请输入 1 到 90 之间的天数。\n'
+    done
+    show_logins "$((10#$days))"
+}
 menu_unban() {
     local ip list
     list=" $(f2b_field 'Banned IP list') "
@@ -899,14 +1018,14 @@ LOGO
     menu_rule
     printf '\n'
     local labels=('初始化防护' '状态与规则' '添加放行端口' '删除放行端口' '替换放行端口' '查看端口监听'
-                  '防火墙开关' '修改 SSH 端口' 'Fail2ban 管理')
+                  '防火墙开关' '修改 SSH 端口' 'Fail2ban 管理' 'SSH 登录记录')
     if (( wide )); then
         menu_pair '端口管理' '防护与 SSH'
         printf '\n'
         for ((i=0;i<6;i++)); do
             left=${labels[i]}
             menu_item "$((i+1))" "$left"
-            if (( i < 3 )); then
+            if (( i < 4 )); then
                 menu_width "$left"; padding=$((28 - 4 - REPLY))
                 # The first column already supplied the row indentation.
                 printf '%*s    %s%2s.%s %s' "$padding" '' "$cyan" "$((i+7))" "$reset" "${labels[i+6]}"
@@ -915,7 +1034,7 @@ LOGO
         done
     else
         printf '  %s端口管理%s\n\n' "$dim" "$reset"
-        for ((i=0;i<9;i++)); do
+        for ((i=0;i<10;i++)); do
             if (( i == 6 )); then printf '\n  %s防护与 SSH%s\n\n' "$dim" "$reset"; fi
             menu_item "$((i+1))" "${labels[i]}"; printf '\n\n'
         done
@@ -1164,12 +1283,12 @@ menu() {
         [[ $columns =~ ^[0-9]+$ ]] || columns=80
         menu_draw "$fw" "$ban" "$current" "$columns"
         while true; do
-            ask choice '  请选择 [0-9]: ' || return 0
+            ask choice '  请选择 [0-10]: ' || return 0
             case "$choice" in
                 0|q|Q) return 0 ;;
-                [1-9]) break ;;
+                [1-9]|10) break ;;
                 '') ;;
-                *) printf '  没有这个选项，请输入 0 到 9。\n' ;;
+                *) printf '  没有这个选项，请输入 0 到 10。\n' ;;
             esac
         done
         case "$choice" in
@@ -1188,6 +1307,7 @@ menu() {
                     printf '\n'
                     if confirm '按当前 SSH 端口重新同步 Fail2ban？' y; then bash "$SELF" sync || true; fi
                 fi ;;
+            10) menu_logins ;;
         esac
         ask reply $'\n按回车返回菜单……' || return 0
     done
@@ -1202,7 +1322,7 @@ if (( $# == 0 )); then mode=menu; fi
 case "${1:-}" in
     install) shift ;;
     help) usage; exit 0 ;;
-    status|ssh|ports|firewall|sync)
+    status|ssh|ports|firewall|sync|logins)
         mode=$1; shift; dispatch_args=("$@"); set -- ;;
 esac
 while (( $# )); do
@@ -1229,7 +1349,7 @@ if [[ -n $connection ]]; then
     read -r _ _ server_addr session_port <<< "$connection"
     valid_port "$session_port" || die '无法正确解析当前 SSH 端口。'
 fi
-if [[ $mode != menu && $mode != status ]]; then
+if [[ $mode != menu && $mode != status && $mode != logins ]]; then
     # Serialize writes across separate SSH windows.
     exec 9>/run/lock/vps-security.lock
     flock -n 9 || die '另一个管理操作正在运行，请稍后重试。'
@@ -1237,6 +1357,10 @@ fi
 case "$mode" in
     menu) menu; exit 0 ;;
     status) show_status; exit 0 ;;
+    logins)
+        days=${dispatch_args[0]:-1}
+        [[ ${#dispatch_args[@]} -le 1 && $days =~ ^[0-9]+$ ]] && (( 10#$days >= 1 && 10#$days <= 90 )) || die '用法：logins [天数，1 到 90]'
+        show_logins "$((10#$days))"; exit 0 ;;
     ports) ports_command "${dispatch_args[@]}"; exit 0 ;;
     firewall)
         [[ ${#dispatch_args[@]} == 1 && ( ${dispatch_args[0]} == enable || ${dispatch_args[0]} == disable ) ]] || die '用法：firewall enable|disable'
