@@ -702,7 +702,7 @@ show_logins() {
         banned=$(fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p') || banned=''
     fi
     python3 - "$days" "$banned" "$c_ok" "$c_warn" "$c_err" "$c_dim" "$c_head" "$c_off" <<'PY'
-import json, re, subprocess, sys, time, unicodedata
+import glob, gzip, json, re, subprocess, sys, time, unicodedata
 from collections import Counter, defaultdict
 days = int(sys.argv[1]); banned = set(sys.argv[2].split())
 ok, warn, err, dim, head, off = sys.argv[3:9]
@@ -788,16 +788,21 @@ else:
 if dropped:
     print(f'  {dim}另外 sshd 自带的防护直接拒绝了 {sum(dropped.values())} 次连接（{len(dropped)} 个 IP 失败太频繁），这些连接没到登录这一步。{off}')
 
-bans = []
-try:
-    with open('/var/log/fail2ban.log', errors='replace') as log:
-        for line in log:
-            m = re.match(r'(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d).*\[sshd\] Ban (\S+)', line)
-            if m and time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')) >= since:
-                bans.append(m.group(2))
-except OSError:
-    pass
-print(f'\n  {dim}Fail2ban 这段时间封禁了 {len(bans)} 次（{len(set(bans))} 个 IP），目前仍在封禁 {len(banned)} 个。{off}\n')
+# logrotate keeps about a month of fail2ban.log: .1 plain, older ones gzipped.
+bans, oldest = [], None
+for path in glob.glob('/var/log/fail2ban.log*'):
+    try:
+        with (gzip.open if path.endswith('.gz') else open)(path, 'rt', errors='replace') as log:
+            for line in log:
+                m = re.match(r'(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)', line)
+                if not m: continue
+                when = time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
+                oldest = when if oldest is None else min(oldest, when)
+                if when >= since and (ban := re.search(r'\[sshd\] Ban (\S+)', line)): bans.append(ban.group(1))
+    except (OSError, EOFError):
+        continue
+note = f'（Fail2ban 日志最早只到 {stamp(oldest)}）' if oldest and oldest > since + 86400 else ''
+print(f'\n  {dim}Fail2ban 这段时间封禁了 {len(bans)} 次（{len(set(bans))} 个 IP），目前仍在封禁 {len(banned)} 个。{note}{off}\n')
 PY
 }
 menu_logins() {
