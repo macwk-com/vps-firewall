@@ -8,116 +8,143 @@ umask 077
 die() { printf '\n错误：%s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'HELP'
+VPS Firewall — Debian 13 服务器安全与端口管理
 用法：
-  bash vpsfw.sh                       # 彩色菜单
-  bash vpsfw.sh install               # 初始化 UFW + Fail2ban
-  bash vpsfw.sh --ssh-port 2222 --realm-ports 23456,41863,59327
-  bash vpsfw.sh
-  bash vpsfw.sh realm list
-  bash vpsfw.sh realm add 41863,59327
-  bash vpsfw.sh realm delete 41863
-  bash vpsfw.sh realm change 23456 53681
-  bash vpsfw.sh ports add 41863 tcp
-  bash vpsfw.sh ports delete 41863 tcp
-  bash vpsfw.sh status
-  bash vpsfw.sh ssh change 38217       # 开启新旧双端口
-  bash vpsfw.sh ssh finish             # 新端口登录后关闭旧端口
-  bash vpsfw.sh ssh rollback           # 取消本次迁移
+  vpsfw                              # 彩色菜单
+  vpsfw install                      # 初始化 UFW + Fail2ban
+  vpsfw --ssh-port 34968              # 使用现有 SSH 端口初始化
+  vpsfw ports list                   # 已保存规则及生效状态
+  vpsfw ports add 443,8000:8010 tcp    # 单端口、范围、逗号列表
+  vpsfw ports add 5432 tcp 192.0.2.8  # 只允许指定来源
+  vpsfw ports delete 5432 tcp 192.0.2.8
+  vpsfw ports change 443 8443 tcp     # 先放行新端口，再删除旧规则
+  vpsfw status
+  vpsfw ssh change 38217             # 开启新旧双端口并同步防护
+  vpsfw ssh finish                   # 新端口登录后关闭旧入口
+  vpsfw ssh rollback
+  vpsfw sync                         # 同步 Fail2ban SSH 端口
+  vpsfw firewall enable|disable
 
-参数：
-  --ssh-port PORT    实际 SSH 监听端口，用于 UFW 和 Fail2ban
-  --realm-ports LIST Realm 本地监听端口，用逗号分隔；同时放行 TCP 和 UDP
-  -h, --help        显示帮助
-
-未传入的端口将交互询问；SSH 默认取当前连接端口，否则必须填写。
-Realm 未传入时交互询问，可留空暂不添加业务端口。
-ssh change 真正修改 SSH 监听端口，并同步 UFW/Fail2ban。
-仅支持标准 ssh.service；socket 激活、自定义 Include/启动参数会停止并提示。
-Realm 的转发配置不自动修改。安装模式保留旧 UFW 规则。
-端口管理识别注释为 Realm TCP/UDP 或 VPS TCP/UDP 的 UFW 放行规则。
-change 先添加新规则、再删除旧规则；请先同步 Realm 和客户端配置。
-仅支持 Debian 13 和直接安装的 Realm，需要 root 和交互终端。
+ports add/delete 端口列表 [tcp|udp|both] [来源IP/CIDR|any]
+ports change 旧端口或范围 新端口或范围 [tcp|udp|both] [来源IP/CIDR|any]
+默认协议 tcp，默认来源 any（所有来源）；范围格式 8000:8010。
+删除/替换按端口、协议和来源精确匹配普通入站放行规则，无需专用标记。
+范围规则须整体删除；SSH 入口通过专用菜单管理。
+初始化仅放行 SSH，其他端口通过端口管理添加。保留已有 UFW 规则。
+适用 Debian 13 宿主机入站流量；不管理应用、容器映射和路由转发。
+SSH 迁移仅支持标准 ssh.service，保留新旧入口直到新会话确认。
 HELP
 }
 valid_port() {
     [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 ))
 }
+valid_spec() {
+    local first=${1%%:*} last=${1##*:}
+    [[ $1 =~ ^[0-9]+(:[0-9]+)?$ ]] && valid_port "$first" && valid_port "$last" && (( 10#$first <= 10#$last ))
+}
 parse_ports() {
-    local list=$1 port
-    [[ $list =~ ^[0-9]+(,[0-9]+)*$ ]] || die '端口列表格式应为 23456,41863，不带空格。'
-    IFS=, read -r -a ports <<< "$list"
-    for port in "${ports[@]}"; do
-        valid_port "$port" || die "端口无效：$port"
+    local list=$1 port existing
+    [[ $list =~ ^[0-9:,]+$ && $list != *, && $list != ,* && $list != *,,* ]] || die '端口格式：443,8000:8010，不带空格。'
+    local raw=()
+    IFS=, read -r -a raw <<< "$list"
+    ports=()
+    for port in "${raw[@]}"; do
+        valid_spec "$port" || die "端口或范围无效：$port"
+        [[ ${port%%:*} != "${port##*:}" ]] || port=${port%%:*}
+        local duplicate=0
+        for existing in ${ports[@]+"${ports[@]}"}; do [[ $port != "$existing" ]] || duplicate=1; done
+        (( duplicate )) || ports+=("$port")
     done
+}
+normalize_source() {
+    python3 - "$1" <<'PYSOURCE'
+import ipaddress,sys
+s=sys.argv[1]
+if s=='any': print(s)
+else:
+    try:
+        n=ipaddress.ip_network(s,strict=True)
+        # Explicit /0 stays address-family-specific, unlike 'any'.
+        print(str(n.network_address) if n.prefixlen==n.max_prefixlen else str(n))
+    except ValueError: raise SystemExit('来源必须是 IP 或正确对齐的 CIDR 网段，例如 192.0.2.0/24')
+PYSOURCE
 }
 load_rules() { rules=$(ufw show added); }
-managed_rule() {
-    local port=$1 proto=$2 label prefix
-    if [[ $proto == tcp ]]; then label=TCP; else label=UDP; fi
-    for prefix in Realm VPS; do
-        if [[ $'\n'$rules$'\n' == *$'\n'"ufw allow $port/$proto comment '$prefix $label'"$'\n'* ]]; then
-            managed_comment="$prefix $label"
-            return 0
-        fi
-    done
-    return 1
+# Parse only simple inbound allow rules. No eval or execution of rule text.
+rule_info() {
+    printf '%s\n' "$rules" | python3 -c '
+import shlex,sys,ipaddress
+port,proto,source=sys.argv[1:]
+def norm(s):
+    if s=="any": return s
+    n=ipaddress.ip_network(s,strict=False)
+    return str(n.network_address) if n.prefixlen==n.max_prefixlen else str(n)
+matches=[]
+for line in sys.stdin:
+    try:
+        t=shlex.split(line)
+        if t[:2]!=["ufw","allow"]: continue
+        t=t[2:]; comment=""
+        if "comment" in t:
+            i=t.index("comment")
+            if len(t)!=i+2: continue
+            comment=t[i+1]; t=t[:i]
+        if t[:1]==["in"]: t=t[1:]
+        if len(t)==1 and "/" in t[0]:
+            rp,rproto=t[0].split("/",1); src="any"
+        else:
+            fields={}; i=0
+            while i<len(t):
+                if t[i] not in ("proto","from","to","port") or t[i] in fields or i+1>=len(t): break
+                fields[t[i]]=t[i+1]; i+=2
+            if i!=len(t) or fields.get("to","any")!="any": continue
+            if "port" not in fields or "proto" not in fields: continue
+            # Do not confuse a source port with a destination port.
+            if "to" not in t or t.index("port")<t.index("to"): continue
+            rp=fields["port"]; rproto=fields["proto"]; src=fields.get("from","any")
+        if (rp,rproto,norm(src))==(port,proto,source): matches.append(comment)
+    except ValueError: continue
+if len(matches)>1:
+    print("精确匹配规则不唯一，请先用 ufw show added 检查",file=sys.stderr); sys.exit(2)
+if not matches: sys.exit(1)
+print(matches[0])
+' "$1" "$2" "${3:-any}"
+}
+existing_rule() {
+    rule_info "$1" "$2" "${3:-any}" >/dev/null
 }
 check_ssh_collision() {
-    local port=$1 line
-    [[ $port != "${session_port:-}" && $port != "${ssh_port:-}" ]] || die "端口 $port 正用于 SSH，不能作为 Realm 端口管理。"
-    # Also protect ports labelled SSH used for SSH management.
-    while IFS= read -r line; do
-        if [[ $line == "ufw allow $port/tcp comment 'SSH'" ]]; then
-            die "端口 $port 有 SSH 放行规则，不能作为 Realm 端口管理。"
-        fi
-    done <<< "$rules"
-    if command -v ss >/dev/null; then
-        local listeners
-        listeners=$(ss -H -lntp "sport = :$port")
-        [[ $listeners != *'"sshd"'* && $listeners != *'"sshd-session"'* ]] || die "端口 $port 正由 SSH 使用。"
-    fi
-}
-check_add() {
-    local port=$1 proto line
-    check_ssh_collision "$port"
-    for proto in tcp udp; do
-        while IFS= read -r line; do
-            if [[ $line == "ufw allow $port/$proto" || $line == "ufw allow $port/$proto comment "* ]]; then
-                managed_rule "$port" "$proto" || die "$port/$proto 已有其他用途的放行规则，请先检查 ufw show added。"
-            fi
-        done <<< "$rules"
-    done
-}
-check_delete() {
-    check_ssh_collision "$1"
-    if ! managed_rule "$1" tcp && ! managed_rule "$1" udp; then
-        die "端口 $1 没有标记为 Realm 的规则，不执行删除。"
-    fi
-}
-add_realm() {
-    ufw allow "$1/tcp" comment 'Realm TCP'
-    ufw allow "$1/udp" comment 'Realm UDP'
-}
-delete_realm() {
-    local proto label
-    for proto in tcp udp; do
-        if managed_rule "$1" "$proto"; then
-            if [[ $proto == tcp ]]; then label=TCP; else label=UDP; fi
-            ufw --force delete allow "$1/$proto" comment "$managed_comment"
+    local spec=$1 proto=${2:-tcp} first=${1%%:*} last=${1##*:} current p listeners
+    [[ $proto == udp ]] && return 0
+    current=$(ssh_ports) || die '无法读取 SSH 配置，暂不修改 TCP 规则。'
+    current="$current,${session_port:-},${ssh_port:-}"
+    local protected=()
+    IFS=, read -r -a protected <<< "$current"
+    for p in "${protected[@]}"; do
+        [[ -n $p ]] || continue
+        if (( 10#$p >= 10#$first && 10#$p <= 10#$last )); then
+            die "端口范围 $spec 包含 SSH 端口 $p，请使用 SSH 专用管理。"
         fi
     done
+    listeners=$(ss -H -lntp "sport >= :$first and sport <= :$last") || die '无法检查实际监听端口。'
+    [[ $listeners != *'"sshd"'* && $listeners != *'"sshd-session"'* ]] || die "端口 $spec 正由 SSH 使用。"
 }
-list_realm() {
-    local line found=0
-    printf '受管理的 UFW 放行规则（非 Realm 实际转发配置）：\n'
-    while IFS= read -r line; do
-        if [[ $line =~ ^ufw\ allow\ [0-9]+/(tcp|udp)\ comment\ \'(Realm|VPS)\ (TCP|UDP)\'$ ]]; then
-            printf '%s\n' "${line#ufw }"
-            found=1
-        fi
-    done <<< "$rules"
-    (( found )) || printf '暂无受管理的业务端口规则。\n'
-    ufw status
+port_rule() {
+    local op=$1 port=$2 proto=$3 source=$4
+    local args=()
+    [[ $op != delete ]] || args+=(--force delete)
+    args+=(allow)
+    if [[ $source == any ]]; then args+=("$port/$proto")
+    else args+=(from "$source" to any port "$port" proto "$proto"); fi
+    if [[ $op != delete ]]; then
+        if [[ $proto == tcp ]]; then args+=(comment 'VPS TCP'); else args+=(comment 'VPS UDP'); fi
+    fi
+    ufw "${args[@]}"
+}
+list_ports() {
+    printf '\n── 所有已保存规则 ──\n%s\n' "$rules"
+    printf '\n── 实际防火墙状态 ──\n'
+    ufw status numbered
 }
 backup_ufw() {
     backup_dir=$(mktemp -d /var/backups/vps-security.XXXXXXXX)
@@ -353,14 +380,19 @@ read_pending() {
     parse_ports "$pending_old"
 }
 ssh_change() {
-    local new=$1 old combined
+    local new=$1 old combined comment lookup_status
     valid_port "$new" || die '请输入 1 到 65535 的端口。'
     ssh_preflight
     old=$(ssh_ports)
     [[ ,$old, != *,$new,* ]] || die '该端口已经是 SSH 监听端口。'
     [[ -z $(ss -H -lnt "sport = :$new") ]] || die '新 TCP 端口已被其他程序使用。'
     load_rules
-    if managed_rule "$new" tcp || managed_rule "$new" udp; then die '该端口已用于受管理的业务规则。'; fi
+    if comment=$(rule_info "$new" tcp); then
+        [[ $comment == SSH ]] || die '新端口已有普通 TCP 放行规则，请先确认用途并删除该规则。'
+    else
+        lookup_status=$?
+        (( lookup_status == 1 )) || die '新端口规则不明确，请先检查。'
+    fi
     printf 'SSH：%s → %s；先保留新旧两个入口。\n' "$old" "$new"
     printf '请在服务商安全组放行 %s/TCP，保留当前窗口。\n' "$new"
     read -r -p '开始迁移？输入 yes: ' answer
@@ -415,7 +447,11 @@ ssh_rollback() {
 }
 show_status() {
     printf '\n── UFW ──\n'
-    if command -v ufw >/dev/null; then ufw status verbose; else printf '未安装\n'; fi
+    if command -v ufw >/dev/null; then
+        ufw status verbose
+        printf '\n── 已保存 UFW 规则 ──\n'
+        ufw show added
+    else printf '未安装\n'; fi
     printf '\n── SSH 实际配置端口 ──\n'
     ssh_ports || true
     printf '\n── Fail2ban SSH ──\n'
@@ -425,44 +461,73 @@ show_status() {
     fi
 }
 ports_command() {
-    local op=${1:-list} list=${2:-} proto=${3:-both} p protocol
+    local op=${1:-list} list=${2:-} proto source new='' p protocol comment
     command -v ufw >/dev/null || die '请先初始化 UFW。'
     load_rules
-    if [[ $op == list ]]; then list_realm; return; fi
-    [[ $op == add || $op == delete ]] || die 'ports 命令支持 list、add、delete。'
+    if [[ $op == list ]]; then
+        (( $# <= 1 )) || die 'ports list 无需其他参数。'
+        list_ports; return
+    fi
+    case "$op" in
+        add|delete)
+            (( $# >= 2 && $# <= 4 )) || die '用法：ports add/delete 端口列表 [协议] [来源]'
+            proto=${3:-tcp}; source=${4:-any} ;;
+        change)
+            (( $# >= 3 && $# <= 5 )) || die '用法：ports change 旧端口 新端口 [协议] [来源]'
+            new=$3; proto=${4:-tcp}; source=${5:-any}
+            valid_spec "$list" && valid_spec "$new" || die '替换操作每次接受一个端口或范围。'
+            [[ ${new%%:*} != "${new##*:}" ]] || new=${new%%:*}
+            [[ ${list%%:*} != "${list##*:}" ]] || list=${list%%:*}
+            [[ $list != "$new" ]] || die '新旧端口相同。' ;;
+        *) die 'ports 支持 list、add、delete、change。' ;;
+    esac
     [[ $proto == tcp || $proto == udp || $proto == both ]] || die '协议为 tcp、udp 或 both。'
+    source=$(normalize_source "$source") || die '来源地址无效。'
     parse_ports "$list"
     local protocols=(tcp udp)
     [[ $proto == both ]] || protocols=("$proto")
-    for p in "${ports[@]}"; do
-        check_ssh_collision "$p"
-        if [[ $op == add ]]; then check_add "$p"; else
-            for protocol in "${protocols[@]}"; do
-                managed_rule "$p" "$protocol" || die "$p/$protocol 没有受本脚本管理的规则。"
-            done
-        fi
-    done
-    backup_ufw
+    # Validate the entire batch before the first mutation.
     for p in "${ports[@]}"; do
         for protocol in "${protocols[@]}"; do
-            load_rules
-            if [[ $op == add ]]; then
-                if ! managed_rule "$p" "$protocol"; then
-                    local label=TCP
-                    [[ $protocol == tcp ]] || label=UDP
-                    ufw allow "$p/$protocol" comment "VPS $label"
-                fi
+            check_ssh_collision "$p" "$protocol"
+            if comment=$(rule_info "$p" "$protocol" "$source"); then
+                [[ $comment != *SSH* && $comment != *ssh* ]] || die 'SSH 标记的规则请通过 SSH 专用管理。'
             else
-                if managed_rule "$p" "$protocol"; then
-                    ufw --force delete allow "$p/$protocol" comment "$managed_comment"
+                local lookup_status=$?
+                (( lookup_status == 1 )) || die '无法明确识别现有规则。'
+                [[ $op == add ]] || die "$p/$protocol 来源 $source 没有精确匹配的普通放行规则。"
+            fi
+            if [[ $op == change ]]; then
+                check_ssh_collision "$new" "$protocol"
+                if comment=$(rule_info "$new" "$protocol" "$source"); then
+                    [[ $comment != *SSH* && $comment != *ssh* ]] || die '新端口规则标记为 SSH。'
+                else
+                    local lookup_status=$?
+                    (( lookup_status == 1 )) || die '无法明确识别新端口规则。'
                 fi
             fi
         done
     done
+    printf '操作：%s；端口：%s；新端口：%s；协议：%s；来源：%s\n' "$op" "$list" "${new:--}" "$proto" "$source"
+    backup_ufw
+    # Complete all additions before any deletions during a replacement.
+    if [[ $op == change ]]; then
+        for protocol in "${protocols[@]}"; do
+            if ! existing_rule "$new" "$protocol" "$source"; then port_rule add "$new" "$protocol" "$source"; fi
+        done
+    fi
+    for p in "${ports[@]}"; do
+        for protocol in "${protocols[@]}"; do
+            case "$op" in
+                add) if ! existing_rule "$p" "$protocol" "$source"; then port_rule add "$p" "$protocol" "$source"; fi ;;
+                delete|change) port_rule delete "$p" "$protocol" "$source" ;;
+            esac
+        done
+    done
     load_rules
-    list_realm
+    list_ports
     prune_backups
-    printf '仅修改 UFW，不修改 Realm 配置；其他宽泛规则仍可能允许该端口。\n'
+    printf '仅修改服务器入站放行规则。已有宽泛规则可能仍允许同一端口；来源限制不会自动撤销其他放行。\n'
 }
 ufw_switch() {
     command -v ufw >/dev/null || die '请先初始化。'
@@ -481,7 +546,7 @@ ufw_switch() {
     fi
 }
 menu() {
-    local choice values proto old new reply rc
+    local choice values proto old new reply rc source
     local cyan='' purple='' reset='' bold=''
     if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
         cyan=$'\033[36m'; purple=$'\033[35m'; reset=$'\033[0m'; bold=$'\033[1m'
@@ -507,8 +572,8 @@ menu() {
         printf '\n  %s1.%s 初始化 UFW + Fail2ban     %s7.%s 启用 / 停用 UFW\n' "$cyan" "$reset" "$cyan" "$reset"
         printf '  %s2.%s 查看状态和全部规则       %s8.%s 修改 SSH 端口（三项同步）\n' "$cyan" "$reset" "$cyan" "$reset"
         printf '  %s3.%s 添加放行端口             %s9.%s 确认迁移，关闭旧 SSH 入口\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '  %s4.%s 删除受管理的放行端口    %s10.%s 回退待确认的 SSH 迁移\n' "$cyan" "$reset" "$cyan" "$reset"
-        printf '  %s5.%s 替换 Realm 放行端口     %s11.%s Fail2ban 状态 / 同步端口\n' "$cyan" "$reset" "$cyan" "$reset"
+        printf '  %s4.%s 删除放行端口            %s10.%s 回退待确认的 SSH 迁移\n' "$cyan" "$reset" "$cyan" "$reset"
+        printf '  %s5.%s 替换放行端口            %s11.%s Fail2ban 状态 / 同步端口\n' "$cyan" "$reset" "$cyan" "$reset"
         printf '  %s6.%s 查看监听端口及程序      %s12.%s 查看备份位置\n' "$cyan" "$reset" "$cyan" "$reset"
         printf '\n  %s0.%s 退出\n\n' "$cyan" "$reset"
         read -r -p '请选择: ' choice || return 0
@@ -518,14 +583,21 @@ menu() {
             1) bash "$SELF" install || rc=$? ;;
             2) bash "$SELF" status || rc=$? ;;
             3|4)
-                read -r -p '端口（多个用逗号分隔）: ' values
-                read -r -p '协议 tcp / udp / both [both]: ' proto
+                read -r -p '端口（443,8000:8010）: ' values
+                read -r -p '协议 tcp / udp / both [tcp]: ' proto
+                read -r -p '来源 IP / CIDR [any 所有来源]: ' source
                 if [[ $choice == 3 ]]; then reply=add; else reply=delete; fi
-                bash "$SELF" ports "$reply" "$values" "${proto:-both}" || rc=$? ;;
+                printf '即将 %s：%s / %s，来源 %s\n' "$reply" "$values" "${proto:-tcp}" "${source:-any}"
+                read -r -p '确认？输入 yes: ' answer
+                if [[ $answer == yes ]]; then bash "$SELF" ports "$reply" "$values" "${proto:-tcp}" "${source:-any}" || rc=$?; fi ;;
             5)
-                read -r -p '旧 Realm 端口: ' old
-                read -r -p '新 Realm 端口: ' new
-                bash "$SELF" realm change "$old" "$new" || rc=$? ;;
+                read -r -p '旧端口或范围: ' old
+                read -r -p '新端口或范围: ' new
+                read -r -p '协议 tcp / udp / both [tcp]: ' proto
+                read -r -p '来源 IP / CIDR [any 所有来源]: ' source
+                printf '%s → %s / %s，来源 %s\n' "$old" "$new" "${proto:-tcp}" "${source:-any}"
+                read -r -p '确认替换？输入 yes: ' answer
+                if [[ $answer == yes ]]; then bash "$SELF" ports change "$old" "$new" "${proto:-tcp}" "${source:-any}" || rc=$?; fi ;;
             6) ss -lntup || rc=$? ;;
             7)
                 read -r -p '输入 enable 启用，disable 停用: ' reply
@@ -548,11 +620,9 @@ menu() {
 }
 
 # Runtime entry point.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 ssh_port=''
-realm_port=''
 mode=install
-realm_command=''
-realm_args=()
 dispatch_args=()
 if (( $# == 0 )); then mode=menu; fi
 case "${1:-}" in
@@ -560,22 +630,11 @@ case "${1:-}" in
     status|ssh|ports|firewall|sync)
         mode=$1; shift; dispatch_args=("$@"); set -- ;;
 esac
-if [[ ${1:-} == realm ]]; then
-    mode=realm
-    shift
-    realm_command=${1:-list}
-    (( $# == 0 )) || shift
-    realm_args=("$@")
-    set --
-fi
 while (( $# )); do
     case "$1" in
         --ssh-port)
             (( $# >= 2 )) || die '--ssh-port 缺少端口值。'
             ssh_port=$2; shift 2 ;;
-        --realm-ports)
-            (( $# >= 2 )) || die '--realm-ports 缺少端口值。'
-            realm_port=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) die "未知参数：$1（使用 --help 查看帮助）" ;;
     esac
@@ -633,50 +692,12 @@ case "$mode" in
         printf 'Fail2ban 已同步 SSH 端口：%s\n' "$current"
         exit 0 ;;
 esac
-if [[ $mode == realm ]]; then
-    command -v ufw >/dev/null || die '请先运行脚本安装模式，安装 UFW。'
-    load_rules
-    case "$realm_command" in
-        list)
-            (( ${#realm_args[@]} == 0 )) || die 'list 无需端口参数。'
-            list_realm
-            exit 0 ;;
-        add|delete)
-            (( ${#realm_args[@]} == 1 )) || die '请提供一个端口或逗号分隔的端口列表。'
-            parse_ports "${realm_args[0]}"
-            for port in "${ports[@]}"; do
-                if [[ $realm_command == add ]]; then check_add "$port"; else check_delete "$port"; fi
-            done
-            backup_ufw
-            for port in "${ports[@]}"; do
-                load_rules
-                if [[ $realm_command == add ]]; then add_realm "$port"; else delete_realm "$port"; fi
-            done ;;
-        change)
-            (( ${#realm_args[@]} == 2 )) || die '用法：realm change 旧端口 新端口'
-            old_port=${realm_args[0]}; new_port=${realm_args[1]}
-            valid_port "$old_port" && valid_port "$new_port" || die '新旧端口必须有效。'
-            [[ $old_port != "$new_port" ]] || die '新旧端口相同，无需修改。'
-            check_delete "$old_port"
-            check_add "$new_port"
-            backup_ufw
-            add_realm "$new_port"
-            delete_realm "$old_port" ;;
-        *) die 'realm 子命令为 list、add、delete、change。' ;;
-    esac
-    load_rules
-    list_realm
-    prune_backups
-    printf '\n仅更新了 UFW 规则；Realm、客户端和云安全组需要对应配置。\n'
-    printf '若有其他宽泛放行规则，删除这里的规则不保证端口完全关闭。\n'
-    exit 0
-fi
 [[ ! -e $PENDING_FILE ]] || die '有待确认的 SSH 迁移，请先完成或回退，暂不重新初始化。'
 default_ssh=$session_port
-printf '适用范围：Debian 13，Realm 直接安装在宿主机上。\n'
+printf '适用范围：Debian 13，服务器宿主机的入站端口与 SSH 防护。\n'
 printf '不适用于 Docker 端口映射、NAT 转发、VPN 网关或已有复杂防火墙的服务器。\n'
 printf '保留已有 UFW 规则；备份后覆盖 /etc/fail2ban/jail.d/sshd.local。\n'
-printf '初始化不修改监听端口；SSH 端口迁移请使用菜单 8。Realm 转发配置需自行维护。\n\n'
+printf '初始化不修改监听端口；SSH 端口迁移请使用菜单 8，其他端口通过菜单 3 添加。\n\n'
 if [[ -z $ssh_port ]]; then
     read -r -p "实际 SSH 端口 [${default_ssh:-必须填写}]: " ssh_port
     ssh_port=${ssh_port:-$default_ssh}
@@ -685,16 +706,7 @@ valid_port "$ssh_port" || die 'SSH 端口必须是 1 到 65535 的整数。'
 if [[ -n $session_port && $ssh_port != "$session_port" ]]; then
     die "当前 SSH 连接使用 $session_port，请填写这个实际端口；修改 SSH 端口须另行操作。"
 fi
-if [[ -z $realm_port ]]; then
-    read -r -p 'Realm 监听端口，多个用逗号分隔（暂不添加可留空）: ' realm_port
-fi
-ports=()
-if [[ -n $realm_port ]]; then parse_ports "$realm_port"; fi
-for port in "${ports[@]}"; do
-    [[ $ssh_port != "$port" ]] || die 'SSH 和 Realm TCP 端口不能相同。'
-done
-
-printf '\n将放行 SSH %s/TCP、Realm %s/TCP 和 UDP。\n' "$ssh_port" "$realm_port"
+printf '\n初始化只放行 SSH 入口（当前 %s/TCP），保留已有规则。\n' "$ssh_port"
 printf '默认拒绝其他未放行入站，允许出站，同时启用 IPv6 防护。\n'
 printf 'SSH：5 分钟内失败 5 次，封禁 SSH 端口 10 分钟。\n'
 printf '请确认 SSH 端口正确，且已准备好服务商网页控制台作为恢复入口。\n'
@@ -702,9 +714,8 @@ read -r -p '确认适用上述场景并开始？输入 yes: ' answer
 [[ $answer == yes ]] || die '已取消，尚未修改配置。'
 
 apt-get update
-apt-get install -y ufw fail2ban python3-systemd nftables iproute2
+apt-get install -y ufw fail2ban python3 python3-systemd nftables iproute2 util-linux
 load_rules
-for port in "${ports[@]}"; do check_add "$port"; done
 
 # Ensure the chosen SSH port actually has a TCP listener before changing UFW.
 if ! ss -H -lnt "sport = :$ssh_port" | grep -q .; then
@@ -746,7 +757,6 @@ fi
 # Add again after enabling IPv6 so both address families have the SSH rule.
 ufw insert 1 allow "$ssh_port/tcp" comment 'SSH'
 for p in "${all_ssh_array[@]}"; do ufw insert 1 allow "$p/tcp" comment 'SSH'; done
-for port in "${ports[@]}"; do add_realm "$port"; done
 ufw default deny incoming
 ufw default allow outgoing
 ufw logging low
@@ -780,8 +790,8 @@ printf '\n===== 实际启用的封禁动作 =====\n'
 fail2ban-client get sshd actions
 prune_backups
 printf '\n配置完成。备份：%s\n' "$backup_dir"
-printf '请保留当前窗口，新开 SSH 连接测试登录，再测试 Realm 的 TCP/UDP 连接。\n'
-printf 'Realm 必须实际监听 %s，客户端也要使用该端口；服务商安全组需同步放行。\n' "$realm_port"
+printf '请保留当前窗口，新开 SSH 连接测试登录。\n'
+printf '其他服务端口通过菜单 3 添加；服务商安全组需同步放行。\n'
 printf '旧的 UFW 放行规则会保留。更换端口后请检查：ufw status numbered\n'
 printf '恢复访问：在原会话或服务商控制台执行 ufw disable\n'
 printf '如被 Fail2ban 误封：fail2ban-client set sshd unbanip 你的公网IP\n'

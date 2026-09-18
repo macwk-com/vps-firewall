@@ -1,6 +1,6 @@
 # VPS Firewall
 
-Debian 13 终端防火墙管理工具：以 UFW 为主，支持多端口管理、SSH 端口迁移和 Fail2ban 同步。
+只管理服务器端口和 SSH：UFW 负责入站放行规则，Fail2ban 负责 SSH 登录失败封禁。适用于 Debian 13。
 
 ## 一键安装
 
@@ -39,7 +39,7 @@ bash install.sh
 下面命令行示例中的 `bash vpsfw.sh`，安装后也可以直接写成 `vpsfw`。
 
 
-适用于 Debian 13、直接运行在宿主机上的 Realm 和标准 `ssh.service`。主界面是终端彩色数字菜单，不需要安装图形桌面。
+适用于 Debian 13 宿主机入站流量和标准 `ssh.service`，不管理应用或代理配置。主界面是终端彩色数字菜单，不需要安装图形桌面。
 
 ## 使用
 
@@ -49,15 +49,15 @@ bash install.sh
 bash vpsfw.sh
 ```
 
-新服务器选择 **1. 初始化 UFW + Fail2ban**。已有这两个工具的服务器可以直接查看状态、管理端口或迁移 SSH，无需反复初始化。初始化会备份并覆盖 Fail2ban 的 `sshd.local`，并保留已有 UFW 规则。
+新服务器选择 **1. 初始化 UFW + Fail2ban**。已有这两个工具的服务器可以直接查看状态、管理端口或迁移 SSH，无需反复初始化。初始化只添加 SSH 放行，备份并覆盖 Fail2ban 的 `sshd.local`，保留已有 UFW 规则。其他端口需要时再添加。
 
 菜单提供：
 
 1. 初始化 UFW + Fail2ban
 2. 查看状态和全部 UFW 规则
-3. 添加一个或多个放行端口，选择 TCP、UDP 或两者
-4. 删除本脚本管理的端口规则
-5. 替换 Realm 放行端口（TCP 和 UDP）
+3. 添加单端口、多个端口或范围；选择 TCP / UDP 和来源 IP / 网段
+4. 按端口、协议、来源精确删除已有放行规则
+5. 替换放行端口或范围（先添加新规则，再删除旧规则）
 6. 查看监听端口及程序
 7. 启用或停用 UFW
 8. 修改 SSH 端口，同步 SSH / UFW / Fail2ban
@@ -85,17 +85,19 @@ bash vpsfw.sh
 
 ```bash
 # 初始化；这里填现有 SSH 端口，不会更改监听
-bash vpsfw.sh --ssh-port 2222 --realm-ports 23456,41863
+bash vpsfw.sh --ssh-port 2222
 
 # TCP、UDP 分别添加，或使用 both
 bash vpsfw.sh ports add 41863,59327 both
 bash vpsfw.sh ports delete 41863 tcp
 bash vpsfw.sh ports list
 
-# Realm 端口管理命令
-bash vpsfw.sh realm add 23456,41863
-bash vpsfw.sh realm change 23456 53681
-bash vpsfw.sh realm delete 41863
+# 范围、指定来源、替换端口
+bash vpsfw.sh ports add 8000:8010 tcp
+bash vpsfw.sh ports add 5432 tcp 192.0.2.8
+bash vpsfw.sh ports add 8443 tcp 2001:db8::/64
+bash vpsfw.sh ports delete 5432 tcp 192.0.2.8
+bash vpsfw.sh ports change 41863 53681 tcp
 
 # 真正修改 SSH 端口：仍分开启新端口和确认两步
 bash vpsfw.sh ssh change 38217
@@ -107,7 +109,19 @@ bash vpsfw.sh status
 bash vpsfw.sh sync
 ```
 
-业务端口管理只修改 UFW，不修改 Realm 的 `listen` / `remote` 或客户端配置。管理带 `Realm TCP/UDP` 或 `VPS TCP/UDP` 注释的规则；其他用途的规则不自动删除。其他宽泛放行规则仍可能允许同一端口。
+省略协议时默认 **TCP**；需要 TCP 和 UDP 时显式选 `both`。来源默认 `any`，也可填 IPv4、IPv6 或 CIDR 网段。多个端口用逗号分隔，范围用冒号，例如 `443,8000:8010`。每项单独建规则，范围须整体删除。
+
+已有的普通入站 TCP/UDP 放行规则直接按端口、协议和来源匹配，无需先标记或接管。原注释不影响管理；新增规则统一使用 `VPS TCP/UDP` 注释。脚本不自动删除出站、路由、网卡绑定、应用配置名称或其他复杂规则。它们仍会显示在全部规则列表中。
+
+普通端口操作会保护当前 SSH 连接、SSH 配置端口、实际 SSH 监听和带 SSH 注释的精确匹配规则；修改 SSH 入口使用菜单 8。UDP 可以使用与 SSH TCP 相同的端口号。批量操作先校验所有输入，再修改；替换端口时先完成新规则添加，添加失败不会删除旧规则。
+
+删除某条规则不保证端口完全关闭：已有的大范围放行或其他规则仍可能允许访问。添加来源限制也不会自动撤销原来的公网放行规则，缩小访问范围时需删除旧的 `any` 规则。放行端口不等于程序正在监听，服务商安全组仍需对应配置。
+
+规则语法依据 [Debian UFW 手册](https://manpages.debian.org/trixie/ufw/ufw.8.en.html)。
+
+## 更新脚本
+
+再次执行一键安装命令即可更新 `/usr/local/bin/vpsfw` 并打开菜单。更新脚本本身不会重新初始化或修改现有规则。旧版应用专用命令已移除，统一使用 `ports add/delete/change/list`；旧规则保持原样且可直接管理。
 
 ## 备份及恢复入口
 
@@ -130,3 +144,5 @@ fail2ban-client set sshd unbanip 你的公网IP
 ## 验证范围
 
 已完成 Bash 语法检查、隔离文件下的真实 OpenSSH 配置检查，以及端口管理、双端口迁移、会话确认、重载失败回退的模拟测试。尚未在真实 Debian 13 VPS 上验证 UFW、systemd、Fail2ban 的端到端行为。
+
+回归测试：`python3 -m unittest discover -s tests -v`。测试使用临时文件和命令替身，不操作宿主机防火墙。
