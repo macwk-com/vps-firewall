@@ -2,10 +2,27 @@
 # VPS Firewall — Debian 13, directly installed services.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export LC_ALL=C
+export LC_ALL=C.UTF-8
 umask 077
 
 die() { printf '\n错误：%s\n' "$*" >&2; exit 1; }
+cancel() { printf '已取消%s。\n' "${1:+，$1}"; exit 0; }
+# Prompt with line editing (arrow keys work) and trim surrounding spaces. Returns 1 on EOF.
+ask() {
+    local __value
+    IFS= read -e -r -p "$2" __value || return 1
+    __value=${__value#"${__value%%[![:space:]]*}"}
+    __value=${__value%"${__value##*[![:space:]]}"}
+    printf -v "$1" '%s' "$__value"
+}
+# confirm 问题 [y|n]：y/yes/是 表示同意，回车取默认值。
+confirm() {
+    local reply default=${2:-n} hint='[y/N]'
+    [[ $default == n ]] || hint='[Y/n]'
+    ask reply "$1 $hint " || return 1
+    reply=$(printf '%s' "${reply:-$default}" | tr '[:upper:]' '[:lower:]')
+    [[ $reply == y || $reply == yes || $reply == 是 ]]
+}
 usage() {
     cat <<'HELP'
 VPS Firewall — Debian 13 服务器安全与端口管理
@@ -24,10 +41,11 @@ VPS Firewall — Debian 13 服务器安全与端口管理
   vpsfw ssh rollback
   vpsfw sync                         # 同步 Fail2ban SSH 端口
   vpsfw firewall enable|disable
+  vpsfw help                         # 显示本帮助
 
 ports add/delete 端口列表 [tcp|udp|both] [来源IP/CIDR|any]
 ports change 旧端口或范围 新端口或范围 [tcp|udp|both] [来源IP/CIDR|any]
-默认协议 tcp，默认来源 any（所有来源）；范围格式 8000:8010。
+默认协议 tcp，默认来源 any（所有来源）；范围写 8000:8010 或 8000-8010。
 删除/替换按端口、协议和来源精确匹配普通入站放行规则，无需专用标记。
 范围规则须整体删除；SSH 入口通过专用菜单管理。
 初始化仅放行 SSH，其他端口通过端口管理添加。保留已有 UFW 规则。
@@ -42,14 +60,21 @@ valid_spec() {
     local first=${1%%:*} last=${1##*:}
     [[ $1 =~ ^[0-9]+(:[0-9]+)?$ ]] && valid_port "$first" && valid_port "$last" && (( 10#$first <= 10#$last ))
 }
+# Tolerate spaces, full-width commas and 8000-8010 style ranges.
+clean_ports() {
+    local v=${1//，/,}
+    v=${v//[[:space:]]/}
+    printf '%s' "${v//-/:}"
+}
 parse_ports() {
-    local list=$1 port existing
-    [[ $list =~ ^[0-9:,]+$ && $list != *, && $list != ,* && $list != *,,* ]] || die '端口格式：443,8000:8010，不带空格。'
+    local list port existing
+    list=$(clean_ports "$1")
+    [[ $list =~ ^[0-9:,]+$ && $list != *, && $list != ,* && $list != *,,* ]] || die "端口格式不对：$1。示例：443 或 443,8000-8010"
     local raw=()
     IFS=, read -r -a raw <<< "$list"
     ports=()
     for port in "${raw[@]}"; do
-        valid_spec "$port" || die "端口或范围无效：$port"
+        valid_spec "$port" || die "端口 ${port//:/-} 不对：端口号是 1 到 65535，范围要从小到大，例如 8000-8010。"
         [[ ${port%%:*} != "${port##*:}" ]] || port=${port%%:*}
         local duplicate=0
         for existing in ${ports[@]+"${ports[@]}"}; do [[ $port != "$existing" ]] || duplicate=1; done
@@ -59,59 +84,92 @@ parse_ports() {
 normalize_source() {
     python3 - "$1" <<'PYSOURCE'
 import ipaddress,sys
-s=sys.argv[1]
-if s=='any': print(s)
+s=sys.argv[1].strip()
+if s.lower() in ('','any'): print('any')
 else:
     try:
         n=ipaddress.ip_network(s,strict=True)
         # Explicit /0 stays address-family-specific, unlike 'any'.
         print(str(n.network_address) if n.prefixlen==n.max_prefixlen else str(n))
-    except ValueError: raise SystemExit('来源必须是 IP 或正确对齐的 CIDR 网段，例如 192.0.2.0/24')
+    except ValueError:
+        try: hint=f'，应写成 {ipaddress.ip_network(s,strict=False)}'
+        except ValueError: hint='，例如 192.0.2.8 或 192.0.2.0/24'
+        raise SystemExit(f'来源 {s} 不是有效的 IP 或网段{hint}')
 PYSOURCE
 }
 load_rules() { rules=$(ufw show added); }
 # Parse only simple inbound allow rules. No eval or execution of rule text.
+# `rule_info --list` prints them as port<TAB>proto<TAB>source<TAB>comment;
+# `rule_info --other` prints the remaining rule lines unchanged;
+# `rule_info 端口 协议 来源` prints the matching rule's comment (1 = none, 2 = ambiguous).
 rule_info() {
     printf '%s\n' "$rules" | python3 -c '
-import shlex,sys,ipaddress
-port,proto,source=sys.argv[1:]
+import shlex,sys,ipaddress,re
 def norm(s):
     if s=="any": return s
     n=ipaddress.ip_network(s,strict=False)
     return str(n.network_address) if n.prefixlen==n.max_prefixlen else str(n)
-matches=[]
+def parse(line):
+    t=shlex.split(line)
+    if t[:2]!=["ufw","allow"]: return None
+    t=t[2:]; comment=""
+    if "comment" in t:
+        i=t.index("comment")
+        if len(t)!=i+2: return None
+        comment=t[i+1]; t=t[:i]
+    if t[:1]==["in"]: t=t[1:]
+    if len(t)==1 and "/" in t[0]:
+        rp,rproto=t[0].split("/",1); src="any"
+    else:
+        fields={}; i=0
+        while i<len(t):
+            if t[i] not in ("proto","from","to","port") or t[i] in fields or i+1>=len(t): break
+            fields[t[i]]=t[i+1]; i+=2
+        if i!=len(t) or fields.get("to","any")!="any": return None
+        if "port" not in fields or "proto" not in fields: return None
+        # Do not confuse a source port with a destination port.
+        if "to" not in t or t.index("port")<t.index("to"): return None
+        rp=fields["port"]; rproto=fields["proto"]; src=fields.get("from","any")
+    return rp,rproto,norm(src),comment
+def listable(row):
+    return row and re.fullmatch(r"\d+(:\d+)?",row[0]) and row[1] in ("tcp","udp")
+rows=[]; other=[]
 for line in sys.stdin:
-    try:
-        t=shlex.split(line)
-        if t[:2]!=["ufw","allow"]: continue
-        t=t[2:]; comment=""
-        if "comment" in t:
-            i=t.index("comment")
-            if len(t)!=i+2: continue
-            comment=t[i+1]; t=t[:i]
-        if t[:1]==["in"]: t=t[1:]
-        if len(t)==1 and "/" in t[0]:
-            rp,rproto=t[0].split("/",1); src="any"
-        else:
-            fields={}; i=0
-            while i<len(t):
-                if t[i] not in ("proto","from","to","port") or t[i] in fields or i+1>=len(t): break
-                fields[t[i]]=t[i+1]; i+=2
-            if i!=len(t) or fields.get("to","any")!="any": continue
-            if "port" not in fields or "proto" not in fields: continue
-            # Do not confuse a source port with a destination port.
-            if "to" not in t or t.index("port")<t.index("to"): continue
-            rp=fields["port"]; rproto=fields["proto"]; src=fields.get("from","any")
-        if (rp,rproto,norm(src))==(port,proto,source): matches.append(comment)
-    except ValueError: continue
+    if not line.startswith("ufw "): continue
+    try: row=parse(line)
+    except ValueError: row=None
+    if row: rows.append(row)
+    if not listable(row): other.append(line.rstrip("\n"))
+if sys.argv[1]=="--list":
+    for row in rows:
+        if listable(row): print("\t".join(x.replace("\t"," ") for x in row))
+    sys.exit(0)
+if sys.argv[1]=="--other":
+    if other: print("\n".join(other))
+    sys.exit(0)
+matches=[row[3] for row in rows if row[:3]==tuple(sys.argv[1:4])]
 if len(matches)>1:
     print("精确匹配规则不唯一，请先用 ufw show added 检查",file=sys.stderr); sys.exit(2)
 if not matches: sys.exit(1)
 print(matches[0])
-' "$1" "$2" "${3:-any}"
+' "$@"
 }
 existing_rule() {
     rule_info "$1" "$2" "${3:-any}" >/dev/null
+}
+# Remaining simple rules of the protocol that open any part of the port or range.
+covering_rules() {
+    local first=${1%%:*} last=${1##*:} proto=$2 only_source=${3:-} rp rproto rsource rcomment
+    while IFS=$'\t' read -r rp rproto rsource rcomment; do
+        [[ $rproto == "$proto" ]] || continue
+        [[ -z $only_source || $rsource == "$only_source" ]] || continue
+        (( 10#${rp%%:*} <= 10#$last && 10#${rp##*:} >= 10#$first )) || continue
+        printf '      %s/%s  来源 %s\n' "$rp" "$rproto" "$(source_label "$rsource")"
+    done < <(rule_info --list)
+}
+source_label() { if [[ $1 == any ]]; then printf '所有来源'; else printf '%s' "$1"; fi; }
+proto_label() {
+    case "$1" in tcp) printf 'TCP' ;; udp) printf 'UDP' ;; *) printf 'TCP+UDP' ;; esac
 }
 check_ssh_collision() {
     local spec=$1 proto=${2:-tcp} first=${1%%:*} last=${1##*:} current p listeners
@@ -123,11 +181,12 @@ check_ssh_collision() {
     for p in "${protected[@]}"; do
         [[ -n $p ]] || continue
         if (( 10#$p >= 10#$first && 10#$p <= 10#$last )); then
-            die "端口范围 $spec 包含 SSH 端口 $p，请使用 SSH 专用管理。"
+            [[ $spec == *:* ]] || die "$spec 是 SSH 端口，请用菜单 8「修改 SSH 端口」管理。"
+            die "端口范围 ${spec/:/-} 包含 SSH 端口 ${p}，请拆开填写，SSH 端口用菜单 8 管理。"
         fi
     done
     listeners=$(ss -H -lntp "sport >= :$first and sport <= :$last") || die '无法检查实际监听端口。'
-    [[ $listeners != *'"sshd"'* && $listeners != *'"sshd-session"'* ]] || die "端口 $spec 正由 SSH 使用。"
+    [[ $listeners != *'"sshd"'* && $listeners != *'"sshd-session"'* ]] || die "端口 ${spec/:/-} 正由 SSH 使用，请用菜单 8 管理。"
 }
 port_rule() {
     local op=$1 port=$2 proto=$3 source=$4
@@ -139,7 +198,11 @@ port_rule() {
     if [[ $op != delete ]]; then
         if [[ $proto == tcp ]]; then args+=(comment 'VPS TCP'); else args+=(comment 'VPS UDP'); fi
     fi
-    ufw "${args[@]}"
+    ufw "${args[@]}" >/dev/null
+}
+# `ufw insert 1` fails on an empty rule set (fresh server), so fall back to a plain allow.
+allow_ssh() {
+    ufw insert 1 allow "$1/tcp" comment 'SSH' >/dev/null 2>&1 || ufw allow "$1/tcp" comment 'SSH' >/dev/null
 }
 list_ports() {
     printf '\n── 所有已保存规则 ──\n%s\n' "$rules"
@@ -183,7 +246,17 @@ SELF=$(readlink -f "${BASH_SOURCE[0]}")
 need_tools() {
     local cmd
     for cmd in ufw fail2ban-client python3 ss sshd; do
-        command -v "$cmd" >/dev/null || die '请先选择菜单 1，初始化 UFW 和 Fail2ban。'
+        command -v "$cmd" >/dev/null || die '还没有初始化：请先在菜单选 1，或运行 vpsfw install。'
+    done
+}
+# sudo/su drop SSH_CONNECTION; recover it from the nearest ancestor process that still has it.
+ssh_connection() {
+    local pid=$$ conn
+    if [[ -n ${SSH_CONNECTION:-} ]]; then printf '%s\n' "$SSH_CONNECTION"; return 0; fi
+    while [[ $pid =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+        conn=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^SSH_CONNECTION=//p') || conn=''
+        if [[ -n $conn ]]; then printf '%s\n' "$conn"; return 0; fi
+        pid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null) || return 0
     done
 }
 ssh_ports() { sshd -T | awk '$1 == "port" {print $2}' | sort -nu | paste -sd, -; }
@@ -212,7 +285,8 @@ banaction = nftables-multiport
 action = nftables-multiport[name=sshd, port="$target_ports", protocol=tcp]
 ignoreip = 127.0.0.1/8 ::1
 EOF
-    fail2ban-client -t
+    local out
+    out=$(fail2ban-client -t 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
 }
 # Restrict automated rewrites to standard Debian includes. Snapshot exactly the files edited.
 ssh_config_files() {
@@ -339,7 +413,7 @@ verify_ssh_ports() {
     local expected=$1 actual p n
     actual=$(ssh_ports)
     expected=$(tr ',' '\n' <<< "$expected" | sort -nu | paste -sd, -)
-    [[ $actual == "$expected" ]] || die "SSH 生效配置端口异常：$actual；期望：$expected"
+    [[ $actual == "$expected" ]] || die "SSH 生效配置端口异常：${actual}；期望：$expected"
     IFS=, read -r -a check_ports <<< "$expected"
     for p in "${check_ports[@]}"; do
         for ((n=0;n<10;n++)); do
@@ -353,14 +427,14 @@ apply_ssh_ports() {
     local target_ports=$1 p
     IFS=, read -r -a target_array <<< "$target_ports"
     for p in "${target_array[@]}"; do
-        ufw insert 1 allow "$p/tcp" comment 'SSH'
+        allow_ssh "$p"
     done
     ssh_config_files edit "$backup_dir" "$target_ports"
     sshd -t
     write_f2b "$target_ports"
     systemctl reload ssh.service
     verify_ssh_ports "$target_ports"
-    systemctl enable fail2ban
+    systemctl enable --quiet fail2ban
     systemctl restart fail2ban
     wait_f2b
     # A later user .local override must not silently prevent synchronization.
@@ -379,6 +453,15 @@ read_pending() {
     valid_port "$pending_new" || die '迁移状态端口无效。'
     parse_ports "$pending_old"
 }
+# The exact command to test a new SSH port from the user's own computer.
+# Behind cloud NAT the server only sees its private address, so fall back to a placeholder.
+ssh_login_hint() {
+    local host=服务器IP
+    if [[ -n ${server_addr:-} ]] && python3 -c 'import ipaddress,sys; sys.exit(not ipaddress.ip_address(sys.argv[1]).is_global)' "$server_addr" 2>/dev/null; then
+        host=$server_addr
+    fi
+    printf 'ssh -p %s %s@%s' "$1" "${SUDO_USER:-$(logname 2>/dev/null || id -un)}" "$host"
+}
 ssh_change() {
     local new=$1 old combined comment lookup_status
     valid_port "$new" || die '请输入 1 到 65535 的端口。'
@@ -387,16 +470,16 @@ ssh_change() {
     [[ ,$old, != *,$new,* ]] || die '该端口已经是 SSH 监听端口。'
     [[ -z $(ss -H -lnt "sport = :$new") ]] || die '新 TCP 端口已被其他程序使用。'
     load_rules
-    if comment=$(rule_info "$new" tcp); then
+    if comment=$(rule_info "$new" tcp any); then
         [[ $comment == SSH ]] || die '新端口已有普通 TCP 放行规则，请先确认用途并删除该规则。'
     else
         lookup_status=$?
         (( lookup_status == 1 )) || die '新端口规则不明确，请先检查。'
     fi
-    printf 'SSH：%s → %s；先保留新旧两个入口。\n' "$old" "$new"
-    printf '请在服务商安全组放行 %s/TCP，保留当前窗口。\n' "$new"
-    read -r -p '开始迁移？输入 yes: ' answer
-    [[ $answer == yes ]] || die '已取消。'
+    printf '\nSSH 端口：%s → %s\n' "$old" "$new"
+    printf '迁移分两步：先让新旧端口同时可用；你用新端口登录成功后，再关闭旧端口。\n'
+    printf '开始前请确认：服务商安全组（云防火墙）已放行 %s/TCP，并且不要关闭当前窗口。\n\n' "$new"
+    confirm '开始第一步？' || cancel '没有修改任何配置'
     ssh_snapshot
     start_transaction
     combined=$(printf '%s,%s\n' "$old" "$new" | tr ',' '\n' | sort -nu | paste -sd, -)
@@ -406,16 +489,22 @@ ssh_change() {
     mv "$PENDING_FILE.tmp" "$PENDING_FILE"
     end_transaction
     prune_backups
-    printf '\n新端口 %s 已监听；旧入口 %s 保留，Fail2ban 同时保护两者。\n' "$new" "$old"
-    printf '请新开终端用新端口登录，然后在新会话运行本脚本，选择「确认迁移」。\n'
+    printf '\n第一步完成：新端口 %s 已开始监听，旧端口 %s 仍然可用，Fail2ban 同时保护两者。\n\n' "$new" "$old"
+    printf '下一步：保留当前窗口，在你自己电脑上新开一个终端执行：\n\n    %s\n\n' "$(ssh_login_hint "$new")"
+    printf '登录成功后，在新窗口里运行 vpsfw，选择 9「确认 SSH 迁移」。\n'
+    printf '如果新端口连不上，回到当前窗口选择 10「回退 SSH 迁移」。\n'
 }
 ssh_finish() {
     read_pending
-    [[ ${session_port:-} == "$pending_new" ]] || die "必须在通过 $pending_new 新建的 SSH 会话中确认；当前会话不会关闭旧入口。"
+    if [[ ${session_port:-} != "$pending_new" ]]; then
+        printf '\n当前窗口是通过 %s 连接的，不能在这里确认。\n' "${session_port:-控制台}" >&2
+        printf '请先用新端口登录（%s），在新窗口里再选 9。\n' "$(ssh_login_hint "$pending_new")" >&2
+        printf '这样可以证明新端口确实能连上，避免把自己锁在外面。\n' >&2
+        exit 1
+    fi
     ssh_preflight pending
-    printf '当前会话使用新端口 %s，将关闭旧监听 %s。\n' "$pending_new" "$pending_old"
-    read -r -p '确认完成迁移？输入 yes: ' answer
-    [[ $answer == yes ]] || die '已取消，继续保留双端口。'
+    printf '当前窗口已通过新端口 %s 登录，接下来关闭旧端口 %s。\n' "$pending_new" "$pending_old"
+    confirm '确认完成迁移？' || cancel '新旧端口继续同时可用'
     ssh_snapshot
     start_transaction
     apply_ssh_ports "$pending_new"
@@ -427,42 +516,177 @@ ssh_finish() {
     IFS=, read -r -a old_array <<< "$pending_old"
     for p in "${old_array[@]}"; do
         if [[ $'\n'$rules$'\n' == *$'\n'"ufw allow $p/tcp comment 'SSH'"$'\n'* ]]; then
-            ufw --force delete allow "$p/tcp" comment 'SSH'
+            ufw --force delete allow "$p/tcp" comment 'SSH' >/dev/null
         fi
     done
     prune_backups
-    printf '迁移完成：SSH 和 Fail2ban 使用 %s；旧 SSH 监听已关闭。\n' "$pending_new"
-    printf '其他未标记的旧 UFW 放行规则不会删除，可在规则列表中检查。\n'
+    printf '\n迁移完成：SSH 只监听 %s，Fail2ban 已同步，旧端口 %s 已关闭。\n' "$pending_new" "$pending_old"
+    printf '记得在服务商安全组里删除旧端口 %s 的放行。\n' "$pending_old"
 }
 ssh_rollback() {
     read_pending
-    printf '将恢复迁移前 SSH 端口 %s；保留新增的 UFW 放行规则以便排查。\n' "$pending_old"
-    read -r -p '确认回退？输入 yes: ' answer
-    [[ $answer == yes ]] || die '已取消。'
+    printf 'SSH 将恢复为迁移前的端口 %s，新端口 %s 停止监听，迁移时为它添加的防火墙放行也一并删除。\n' "$pending_old" "$pending_new"
+    confirm '确认回退？' || cancel
     restore_ssh_backup "$pending_backup"
     rm -f "$PENDING_FILE"
     backup_dir=$pending_backup
+    printf '已回退：SSH 和 Fail2ban 恢复为迁移前的配置（端口 %s）。\n' "$pending_old"
+    # Cleanup only after SSH is back on the old port; a rule that predates the migration stays.
+    load_rules
+    if [[ $'\n'$rules$'\n' != *$'\n'"ufw allow $pending_new/tcp comment 'SSH'"$'\n'* ]]; then
+        :
+    elif grep -qs "^### tuple ### allow tcp $pending_new " "$pending_backup/ufw/user.rules" "$pending_backup/ufw/user6.rules"; then
+        printf '%s/tcp 的放行规则在迁移前就已存在，保留不动。\n' "$pending_new"
+    elif ! (verify_ssh_ports "$pending_old") 2>/dev/null; then
+        printf '旧端口 %s 没有确认恢复监听，%s/tcp 的放行规则先保留，请检查后手动处理。\n' "$pending_old" "$pending_new" >&2
+    elif ufw --force delete allow "$pending_new/tcp" comment 'SSH' >/dev/null; then
+        printf '已删除 %s/tcp 的防火墙放行；服务商安全组里的这条放行也可以删掉。\n' "$pending_new"
+    else
+        printf '删除 %s/tcp 的防火墙放行失败，请手动执行：ufw delete allow %s/tcp\n' "$pending_new" "$pending_new" >&2
+    fi
     prune_backups
-    printf '已恢复迁移前的 SSH 和 Fail2ban 配置。\n'
 }
-show_status() {
-    printf '\n── UFW ──\n'
-    if command -v ufw >/dev/null; then
-        ufw status verbose
-        printf '\n── 已保存 UFW 规则 ──\n'
-        ufw show added
-    else printf '未安装\n'; fi
-    printf '\n── SSH 实际配置端口 ──\n'
-    ssh_ports || true
-    printf '\n── Fail2ban SSH ──\n'
-    if command -v fail2ban-client >/dev/null; then fail2ban-client status sshd || true; else printf '未安装\n'; fi
-    if [[ -f $PENDING_FILE ]]; then
-        printf '\n有待确认的 SSH 迁移；请通过新端口登录后选择「确认迁移」。\n'
+# Colors only on a real terminal; NO_COLOR turns them off.
+set_colors() {
+    c_ok='' c_warn='' c_err='' c_dim='' c_head='' c_off=''
+    if [[ -t 1 && ${TERM:-dumb} != dumb && ${NO_COLOR+x} != x ]]; then
+        c_ok=$'\033[32m' c_warn=$'\033[33m' c_err=$'\033[31m'
+        c_dim=$'\033[90m' c_head=$'\033[1;36m' c_off=$'\033[0m'
     fi
 }
+section() { printf '\n  %s%s%s\n' "$c_head" "$1" "$c_off"; }
+# status_row 标签 值 值的颜色 说明
+status_row() {
+    printf '  %s%s%s%s  %s%s%s\n' "$(pad "$1" 10)" "$3" "$(pad "$2" 12)" "$c_off" "$c_dim" "${4:-}" "$c_off"
+}
+human_seconds() {
+    local s=$1
+    if [[ ! $s =~ ^-?[0-9]+$ ]]; then printf '%s' "$s"
+    elif (( s < 0 )); then printf '永久'
+    elif (( s >= 3600 && s % 3600 == 0 )); then printf '%s 小时' $((s / 3600))
+    elif (( s >= 60 && s % 60 == 0 )); then printf '%s 分钟' $((s / 60))
+    else printf '%s 秒' "$s"; fi
+}
+# Read the sshd jail into f2b_state / f2b_color / f2b_status (empty when not running).
+read_f2b() {
+    f2b_status=''
+    if ! command -v fail2ban-client >/dev/null; then
+        f2b_state='● 未安装'; f2b_color=$c_err
+    elif f2b_status=$(fail2ban-client status sshd 2>/dev/null); then
+        f2b_state='● 保护中'; f2b_color=$c_ok
+    else
+        f2b_state='● 未运行'; f2b_color=$c_warn; f2b_status=''
+    fi
+}
+# One "Name:<TAB>value" field of `fail2ban-client status sshd`.
+f2b_field() { printf '%s\n' "$f2b_status" | sed -n "s/.*$1:[[:space:]]*//p"; }
+print_banned() {
+    local list total
+    list=$(f2b_field 'Banned IP list')
+    if [[ -z $list ]]; then printf '  %s无%s\n' "$c_dim" "$c_off"; return 0; fi
+    total=$(wc -w <<< "$list")
+    printf '%s\n' $list | awk 'NR <= 30 {
+        if (line != "" && length(line) + length($1) > 70) { print line; line = "" }
+        line = line (line == "" ? "  " : "   ") $1
+    } END { if (line != "") print line }'
+    (( total <= 30 )) || printf '  %s……共 %s 个，只显示前 30 个%s\n' "$c_dim" "$total" "$c_off"
+}
+show_status() {
+    set_colors
+    local raw fw='● 未安装' fw_color=$c_err fw_note='请先初始化（菜单 1）' policy_in policy_out ipv6
+    local ssh ssh_color='' ssh_note f2b_note rows others count rp rproto rsource rcomment
+    if command -v ufw >/dev/null; then
+        raw=$(ufw status 2>/dev/null) || raw=''
+        policy_in=$(sed -n 's/^DEFAULT_INPUT_POLICY="\(.*\)"$/\1/p' /etc/default/ufw)
+        policy_out=$(sed -n 's/^DEFAULT_OUTPUT_POLICY="\(.*\)"$/\1/p' /etc/default/ufw)
+        if grep -q '^IPV6=yes' /etc/default/ufw; then ipv6='IPv6 开启'; else ipv6='IPv6 未开启'; fi
+        if [[ $policy_in == ACCEPT ]]; then policy_in='默认放行所有入站'; else policy_in='拒绝未放行的入站'; fi
+        if [[ $policy_out == ACCEPT ]]; then policy_out='允许出站'; else policy_out='限制出站'; fi
+        case "$raw" in
+            'Status: active'*) fw='● 已启用'; fw_color=$c_ok; fw_note="$policy_in · $policy_out · $ipv6" ;;
+            'Status: inactive'*) fw='● 未启用'; fw_color=$c_warn; fw_note='下面的规则已保存，启用后才生效（菜单 7）' ;;
+            *) fw='● 状态异常'; fw_note='请运行 ufw status 查看' ;;
+        esac
+    fi
+    ssh=$(ssh_ports 2>/dev/null) || ssh=''
+    if [[ -f $PENDING_FILE ]]; then ssh_color=$c_warn; ssh_note='迁移待确认：请从新端口登录后选 9'
+    elif [[ -n ${session_port:-} ]]; then ssh_note="当前连接 $session_port"
+    else ssh_note='当前在控制台'; fi
+    read_f2b
+    case "$f2b_state" in
+        *保护中) f2b_note="封禁中 $(f2b_field 'Currently banned') 个 · 累计 $(f2b_field 'Total banned') 次" ;;
+        *未运行) f2b_note='SSH 登录保护没有运行，可在菜单 11 同步' ;;
+        *) f2b_note='请先初始化（菜单 1）' ;;
+    esac
+
+    section '防护状态'
+    status_row 防火墙 "$fw" "$fw_color" "$fw_note"
+    status_row SSH "${ssh:-未知}" "$ssh_color" "$ssh_note"
+    status_row Fail2ban "$f2b_state" "$f2b_color" "$f2b_note"
+
+    if command -v ufw >/dev/null; then
+        load_rules
+        rows=$(rule_info --list); others=$(rule_info --other)
+        count=0; [[ -z $rows ]] || count=$(wc -l <<< "$rows")
+        section "放行规则（$count 条）"
+        if (( count == 0 )); then
+            printf '  %s无%s\n' "$c_dim" "$c_off"
+        else
+            printf '  %s%s%s%s备注%s\n' "$c_dim" "$(pad 端口 12)" "$(pad 协议 6)" "$(pad 来源 20)" "$c_off"
+            while IFS=$'\t' read -r rp rproto rsource rcomment; do
+                printf '  %s%s%s %s%s%s\n' "$(pad "$rp" 12)" "$(pad "$(proto_label "$rproto")" 6)" \
+                    "$(pad "$(source_label "$rsource")" 19)" "$c_dim" "$rcomment" "$c_off"
+            done <<< "$rows"
+        fi
+        if [[ -n $others ]]; then
+            section '其他规则（不在本工具管理范围，原样显示）'
+            printf '%s\n' "$others" | sed "s/^/  $c_dim/; s/\$/$c_off/"
+        fi
+    fi
+    if [[ -n $f2b_status ]]; then
+        section '正在封禁的 IP'
+        print_banned
+    fi
+    printf '\n'
+}
+# Fail2ban details for menu 11; sets f2b_sync=1 when the jail needs resyncing.
+show_f2b() {
+    set_colors
+    read_f2b
+    local ssh ports maxretry findtime bantime
+    f2b_sync=0
+    ssh=$(ssh_ports 2>/dev/null) || ssh=''
+    section 'Fail2ban · SSH 登录保护'
+    if [[ -z $f2b_status ]]; then
+        if [[ $f2b_state == *未安装 ]]; then
+            status_row 状态 "$f2b_state" "$f2b_color" '请先初始化（菜单 1）'
+        else
+            status_row 状态 "$f2b_state" "$f2b_color" 'SSH 登录保护没有运行'
+            f2b_sync=1
+        fi
+        return 0
+    fi
+    ports=$(fail2ban-client get sshd action nftables-multiport port 2>/dev/null) || ports=''
+    maxretry=$(fail2ban-client get sshd maxretry 2>/dev/null) || maxretry='?'
+    findtime=$(fail2ban-client get sshd findtime 2>/dev/null) || findtime='?'
+    bantime=$(fail2ban-client get sshd bantime 2>/dev/null) || bantime='?'
+    status_row 状态 "$f2b_state" "$f2b_color"
+    if [[ -n $ports && $ports == "$ssh" ]]; then
+        status_row 保护端口 "$ports" '' '与 SSH 端口一致'
+    else
+        status_row 保护端口 "${ports:-未知}" "$c_warn" "SSH 实际端口是 ${ssh:-未知}，需要同步"
+        f2b_sync=1
+    fi
+    status_row 封禁条件 "失败 $maxretry 次" '' "$(human_seconds "$findtime")内失败 $maxretry 次，封禁 $(human_seconds "$bantime")"
+    status_row 封禁中 "$(f2b_field 'Currently banned') 个 IP" '' "累计封禁 $(f2b_field 'Total banned') 次"
+    status_row 近期失败 "$(f2b_field 'Currently failed') 次" '' "统计窗口内还没达到封禁条件的失败登录"
+    section '正在封禁的 IP'
+    print_banned
+    printf '\n  %s解封某个 IP：fail2ban-client set sshd unbanip IP地址%s\n' "$c_dim" "$c_off"
+}
 ports_command() {
-    local op=${1:-list} list=${2:-} proto source new='' p protocol comment
-    command -v ufw >/dev/null || die '请先初始化 UFW。'
+    local op=${1:-list} list=${2:-} proto source new='' p protocol comment covering
+    command -v ufw >/dev/null || die '还没有初始化：请先在菜单选 1，或运行 vpsfw install。'
     load_rules
     if [[ $op == list ]]; then
         (( $# <= 1 )) || die 'ports list 无需其他参数。'
@@ -474,14 +698,15 @@ ports_command() {
             proto=${3:-tcp}; source=${4:-any} ;;
         change)
             (( $# >= 3 && $# <= 5 )) || die '用法：ports change 旧端口 新端口 [协议] [来源]'
-            new=$3; proto=${4:-tcp}; source=${5:-any}
+            list=$(clean_ports "$list"); new=$(clean_ports "$3"); proto=${4:-tcp}; source=${5:-any}
             valid_spec "$list" && valid_spec "$new" || die '替换操作每次接受一个端口或范围。'
             [[ ${new%%:*} != "${new##*:}" ]] || new=${new%%:*}
             [[ ${list%%:*} != "${list##*:}" ]] || list=${list%%:*}
             [[ $list != "$new" ]] || die '新旧端口相同。' ;;
         *) die 'ports 支持 list、add、delete、change。' ;;
     esac
-    [[ $proto == tcp || $proto == udp || $proto == both ]] || die '协议为 tcp、udp 或 both。'
+    proto=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
+    [[ $proto == tcp || $proto == udp || $proto == both ]] || die "协议只能是 tcp、udp 或 both（两者都要），收到：$proto"
     source=$(normalize_source "$source") || die '来源地址无效。'
     parse_ports "$list"
     local protocols=(tcp udp)
@@ -491,16 +716,16 @@ ports_command() {
         for protocol in "${protocols[@]}"; do
             check_ssh_collision "$p" "$protocol"
             if comment=$(rule_info "$p" "$protocol" "$source"); then
-                [[ $comment != *SSH* && $comment != *ssh* ]] || die 'SSH 标记的规则请通过 SSH 专用管理。'
+                [[ $comment != *SSH* && $comment != *ssh* ]] || die "$p/$protocol 是 SSH 入口，请用菜单 8「修改 SSH 端口」管理。"
             else
                 local lookup_status=$?
                 (( lookup_status == 1 )) || die '无法明确识别现有规则。'
-                [[ $op == add ]] || die "$p/$protocol 来源 $source 没有精确匹配的普通放行规则。"
+                [[ $op == add ]] || die "找不到 $p/${protocol}（来源 $(source_label "$source")）的放行规则。用 vpsfw ports list 查看现有规则。"
             fi
             if [[ $op == change ]]; then
                 check_ssh_collision "$new" "$protocol"
                 if comment=$(rule_info "$new" "$protocol" "$source"); then
-                    [[ $comment != *SSH* && $comment != *ssh* ]] || die '新端口规则标记为 SSH。'
+                    [[ $comment != *SSH* && $comment != *ssh* ]] || die "$new/$protocol 是 SSH 入口，不能作为替换目标。"
                 else
                     local lookup_status=$?
                     (( lookup_status == 1 )) || die '无法明确识别新端口规则。'
@@ -508,49 +733,90 @@ ports_command() {
             fi
         done
     done
-    printf '操作：%s；端口：%s；新端口：%s；协议：%s；来源：%s\n' "$op" "$list" "${new:--}" "$proto" "$source"
+    local joined
+    joined=$(IFS=,; printf '%s' "${ports[*]}")
+    case "$op" in
+        add) printf '\n添加放行：%s' "$joined" ;;
+        delete) printf '\n删除放行：%s' "$joined" ;;
+        change) printf '\n替换放行：%s → %s' "$list" "$new" ;;
+    esac
+    printf '  %s  来源 %s\n' "$(proto_label "$proto")" "$(source_label "$source")"
     backup_ufw
     # Complete all additions before any deletions during a replacement.
     if [[ $op == change ]]; then
         for protocol in "${protocols[@]}"; do
             if ! existing_rule "$new" "$protocol" "$source"; then port_rule add "$new" "$protocol" "$source"; fi
+            printf '  ✓ 已放行 %s/%s\n' "$new" "$protocol"
         done
     fi
     for p in "${ports[@]}"; do
         for protocol in "${protocols[@]}"; do
             case "$op" in
-                add) if ! existing_rule "$p" "$protocol" "$source"; then port_rule add "$p" "$protocol" "$source"; fi ;;
-                delete|change) port_rule delete "$p" "$protocol" "$source" ;;
+                add)
+                    if existing_rule "$p" "$protocol" "$source"; then
+                        printf '  · %s/%s 已经放行，跳过\n' "$p" "$protocol"
+                    else
+                        port_rule add "$p" "$protocol" "$source"
+                        printf '  ✓ 已放行 %s/%s\n' "$p" "$protocol"
+                    fi ;;
+                delete|change)
+                    port_rule delete "$p" "$protocol" "$source"
+                    printf '  ✓ 已删除 %s/%s\n' "$p" "$protocol" ;;
             esac
         done
     done
     load_rules
-    list_ports
     prune_backups
-    printf '仅修改服务器入站放行规则。已有宽泛规则可能仍允许同一端口；来源限制不会自动撤销其他放行。\n'
+    # Point out rules that still decide access, instead of a generic disclaimer.
+    for p in "${ports[@]}"; do
+        for protocol in "${protocols[@]}"; do
+            covering=''
+            if [[ $op == add && $source != any ]]; then
+                covering=$(covering_rules "$p" "$protocol" any)
+                [[ -z $covering ]] || printf '\n注意：%s/%s 还有对所有来源开放的规则，只限来源 %s 不会生效：\n%s\n如需收紧，请删除上面这条规则。\n' "$p" "$protocol" "$source" "$covering"
+            elif [[ $op != add ]]; then
+                covering=$(covering_rules "$p" "$protocol")
+                [[ -z $covering ]] || printf '\n注意：%s/%s 仍被下面的规则放行：\n%s\n' "$p" "$protocol" "$covering"
+            fi
+        done
+    done
+    if [[ $(ufw status) != 'Status: active'* ]]; then
+        printf '\n防火墙当前未启用，规则已保存，启用后才生效（菜单 7）。\n'
+    elif [[ $op != delete ]]; then
+        printf '\n服务商安全组（云防火墙）也需要放行对应端口，外部才能访问。\n'
+    fi
 }
 ufw_switch() {
-    command -v ufw >/dev/null || die '请先初始化。'
+    command -v ufw >/dev/null || die '还没有初始化：请先在菜单选 1，或运行 vpsfw install。'
     if [[ $1 == enable ]]; then
         local p current
         current=$(ssh_ports)
         [[ -n $current ]] || die '无法识别 SSH 端口，拒绝启用。'
+        printf '启用防火墙：先确保 SSH 端口 %s 放行，其他未放行的入站连接将被拒绝。\n' "$current"
+        confirm '现在启用？' y || cancel
         IFS=, read -r -a current_ports <<< "$current"
-        for p in "${current_ports[@]}"; do ufw insert 1 allow "$p/tcp" comment 'SSH'; done
-        if [[ -n ${session_port:-} ]]; then ufw insert 1 allow "$session_port/tcp" comment 'SSH'; fi
-        ufw enable
+        for p in "${current_ports[@]}"; do allow_ssh "$p"; done
+        if [[ -n ${session_port:-} ]]; then allow_ssh "$session_port"; fi
+        ufw --force enable
     else
-        read -r -p '停用 UFW 会撤销其防护。确认？输入 yes: ' answer
-        [[ $answer == yes ]] || die '已取消。'
+        printf '停用防火墙后，服务器上所有监听中的端口都会对外开放（Fail2ban 仍然工作）。\n'
+        confirm '确认停用？' || cancel
         ufw disable
     fi
 }
-# Menu labels use ASCII and three-byte CJK characters. Count terminal cells,
-# not UTF-8 bytes, so Chinese labels and two-digit numbers stay aligned.
+# Count terminal cells rather than characters: CJK characters take two cells,
+# so Chinese labels and two-digit numbers stay aligned. ● and · take one.
 menu_width() {
-    local text=$1 ascii
+    local text=${1//[●·]/.} ascii
     ascii=${text//[! -~]/}
-    REPLY=$(( ${#ascii} + (${#text} - ${#ascii}) / 3 * 2 ))
+    REPLY=$(( ${#ascii} + (${#text} - ${#ascii}) * 2 ))
+}
+# Print text padded to the given number of terminal cells.
+pad() {
+    menu_width "$1"
+    local padding=$(( $2 - REPLY ))
+    (( padding > 0 )) || padding=0
+    printf '%s%*s' "$1" "$padding" ''
 }
 menu_pair() {
     local left=$1 right=$2 padding
@@ -580,21 +846,14 @@ menu_draw() {
         (( menu_span >= 24 )) || menu_span=24
     fi
     printf '\n'
-    if (( wide )); then
-        printf '%s' "$cyan"
-        printf '  __   ______  ____     ____  _   _ ___ _____ _     ____  \n'
-        printf '  \\ \\ / /  _ \\/ ___|   / ___|| | | |_ _| ____| |   |  _ \\ \n'
-        printf '   \\ V /| |_) \\___ \\   \\___ \\| |_| || ||  _| | |   | | | |\n'
-        printf '    \\_/ | .__/|____/   |____/ \\___/|___|_____|_____|____/ \n'
-        printf '        |_|%s\n' "$reset"
-    else
+    if (( columns >= 44 )); then
         printf '%s' "$cyan"
         cat <<'LOGO'
-  __   ______  ____
-  \ \ / /  _ \/ ___|
-   \ V /| |_) \___ \
-    \_/ | .__/|____/
-        |_|
+  __     ______  ____  _______        __
+  \ \   / /  _ \/ ___||  ___\ \      / /
+   \ \ / /| |_) \___ \| |_   \ \ /\ / /
+    \ V / |  __/ ___) |  _|   \ V  V /
+     \_/  |_|   |____/|_|      \_/\_/
 LOGO
         printf '%s' "$reset"
     fi
@@ -633,11 +892,165 @@ LOGO
     menu_item 0 '退出'; printf '\n'; menu_rule
     if [[ -f $PENDING_FILE ]]; then
         printf '\n  %sSSH 迁移待确认%s\n  请从新端口登录，再选择 9。\n' "$cyan" "$reset"
+    elif [[ $fw == 未安装 ]]; then
+        printf '\n  %s尚未初始化%s\n  新服务器请先选择 1。\n' "$cyan" "$reset"
     fi
     printf '\n'
 }
+# ── Menu dialogs: validate each answer on the spot; a blank answer goes back to the menu. ──
+ask_ports() {
+    local value
+    while ask value "$1" && [[ -n $value ]]; do
+        if REPLY=$(parse_ports "$value" && IFS=, && printf '%s' "${ports[*]}"); then return 0; fi
+    done
+    return 1
+}
+ask_proto() {
+    local value
+    while ask value '协议：1) TCP  2) UDP  3) TCP+UDP  [回车 = 1]: '; do
+        case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+            ''|1|tcp) REPLY=tcp; return 0 ;;
+            2|udp) REPLY=udp; return 0 ;;
+            3|both|tcp+udp) REPLY=both; return 0 ;;
+            *) printf '请输入 1、2 或 3。\n' ;;
+        esac
+    done
+    return 1
+}
+ask_source() {
+    local value
+    while ask value '来源：只允许某个 IP 或网段时填写，回车 = 所有来源: '; do
+        if REPLY=$(normalize_source "${value:-any}"); then return 0; fi
+    done
+    return 1
+}
+# Number the plain allow rules into menu_rules; SSH entries are left to the SSH menu.
+show_rules() {
+    local rp rproto rsource rcomment ssh p covers n=0
+    menu_rules=()
+    load_rules
+    ssh=$(ssh_ports 2>/dev/null) || ssh=''
+    while IFS=$'\t' read -r rp rproto rsource rcomment; do
+        [[ $rcomment != *SSH* && $rcomment != *ssh* ]] || continue
+        covers=0
+        if [[ $rproto == tcp ]]; then
+            for p in ${ssh//,/ } ${session_port:-}; do
+                (( 10#$p < 10#${rp%%:*} || 10#$p > 10#${rp##*:} )) || covers=1
+            done
+        fi
+        (( ! covers )) || continue
+        menu_rules+=("$rp"$'\t'"$rproto"$'\t'"$rsource")
+        if (( n == 0 )); then
+            printf '\n  %s%s%s%s备注\n' "$(pad 编号 6)" "$(pad 端口 14)" "$(pad 协议 6)" "$(pad 来源 22)"
+        fi
+        n=$((n + 1))
+        printf '  %s%s%s%s%s\n' "$(pad "$n" 6)" "$(pad "$rp" 14)" "$(pad "$(proto_label "$rproto")" 6)" \
+            "$(pad "$(source_label "$rsource")" 22)" "$rcomment"
+    done < <(rule_info --list)
+    if (( n == 0 )); then
+        printf '\n目前没有可管理的端口放行规则（SSH 入口请用菜单 8 管理）。\n'
+        return 1
+    fi
+    printf '\n  SSH 入口不在此列出，请用菜单 8 管理。\n\n'
+}
+# Read rule numbers into picked; $2=1 allows several, e.g. "1,3" or "1 3".
+ask_rule_numbers() {
+    local value item seen
+    while ask value "$1" && [[ -n $value ]]; do
+        value=${value//，/ }; value=${value//,/ }
+        picked=(); seen=' '
+        for item in $value; do
+            if [[ ! $item =~ ^[0-9]+$ ]] || (( 10#$item < 1 || 10#$item > ${#menu_rules[@]} )); then
+                printf '没有编号 %s，请输入 1 到 %s 之间的编号。\n' "$item" "${#menu_rules[@]}"; picked=(); break
+            fi
+            [[ $seen == *" $((10#$item)) "* ]] || picked+=($((10#$item - 1)))
+            seen+="$((10#$item)) "
+        done
+        (( ${#picked[@]} )) || continue
+        if (( ${2:-0} == 0 && ${#picked[@]} > 1 )); then printf '一次只能选一条。\n'; continue; fi
+        return 0
+    done
+    return 1
+}
+menu_add() {
+    local list proto source
+    printf '\n添加放行端口。多个端口用逗号分隔，范围写 8000-8010。\n\n'
+    ask_ports '端口（回车返回）: ' || return 0; list=$REPLY
+    ask_proto || return 0; proto=$REPLY
+    ask_source || return 0; source=$REPLY
+    printf '\n将放行：%s  %s  来源 %s\n' "$list" "$(proto_label "$proto")" "$(source_label "$source")"
+    confirm '确认添加？' y || { printf '已取消。\n'; return 0; }
+    bash "$SELF" ports add "$list" "$proto" "$source" || true
+}
+menu_delete() {
+    local i key rp rproto rsource list groups=()
+    show_rules || return 0
+    ask_rule_numbers '要删除哪几条？输入编号，多个用逗号分隔（回车返回）: ' 1 || return 0
+    printf '\n将删除：\n'
+    for i in "${picked[@]}"; do
+        IFS=$'\t' read -r rp rproto rsource <<< "${menu_rules[i]}"
+        printf '  %s/%s  来源 %s\n' "$rp" "$rproto" "$(source_label "$rsource")"
+        key="$rproto"$'\t'"$rsource"
+        [[ " ${groups[*]-} " == *" $key "* ]] || groups+=("$key")
+    done
+    confirm '确认删除？' || { printf '已取消。\n'; return 0; }
+    # One call per protocol and source; each call checks its whole batch before changing anything.
+    for key in "${groups[@]}"; do
+        list=''
+        for i in "${picked[@]}"; do
+            IFS=$'\t' read -r rp rproto rsource <<< "${menu_rules[i]}"
+            [[ "$rproto"$'\t'"$rsource" != "$key" ]] || list+=${list:+,}$rp
+        done
+        bash "$SELF" ports delete "$list" "${key%%$'\t'*}" "${key#*$'\t'}" || true
+    done
+}
+menu_change() {
+    local rp rproto rsource value new
+    show_rules || return 0
+    ask_rule_numbers '要替换哪一条？输入编号（回车返回）: ' 0 || return 0
+    IFS=$'\t' read -r rp rproto rsource <<< "${menu_rules[picked[0]]}"
+    printf '\n原规则：%s/%s  来源 %s\n' "$rp" "$rproto" "$(source_label "$rsource")"
+    while true; do
+        ask value '新端口或范围（回车返回）: ' && [[ -n $value ]] || return 0
+        new=$(clean_ports "$value")
+        valid_spec "$new" && [[ $new != "$rp" ]] && break
+        printf '请输入一个与原来不同的端口（1-65535）或范围，例如 8443 或 8000-8010。\n'
+    done
+    printf '\n将替换：%s → %s  %s  来源 %s（先放行新端口，再删除旧规则）\n' "$rp" "$new" "$(proto_label "$rproto")" "$(source_label "$rsource")"
+    confirm '确认替换？' y || { printf '已取消。\n'; return 0; }
+    bash "$SELF" ports change "$rp" "$new" "$rproto" "$rsource" || true
+}
+show_listeners() {
+    printf '\n  %s%s%s程序\n' "$(pad 协议 6)" "$(pad 端口 8)" "$(pad 监听地址 26)"
+    ss -H -lntup | awk '{
+        port=$5; sub(/.*:/, "", port); addr=$5; sub(/:[^:]*$/, "", addr)
+        prog="-"; if (match($0, /users:\(\("[^"]+"/)) prog=substr($0, RSTART+9, RLENGTH-10)
+        if (!seen[$1 " " port " " prog]++) printf "  %-6s%-8s%-26s%s\n", $1, port, addr, prog
+    }' | sort -k2,2n -k1,1
+}
+menu_firewall() {
+    command -v ufw >/dev/null || { printf '还没有初始化，请先选择 1。\n'; return 0; }
+    if [[ $(ufw status) == 'Status: active'* ]]; then
+        printf '\n防火墙当前：已启用\n'
+        bash "$SELF" firewall disable || true
+    else
+        printf '\n防火墙当前：未启用\n'
+        bash "$SELF" firewall enable || true
+    fi
+}
+menu_ssh_change() {
+    local new current
+    current=$(ssh_ports 2>/dev/null) || current='未知'
+    printf '\n当前 SSH 端口：%s\n建议使用 10000-65535 之间、没被其他程序占用的端口。\n\n' "${current:-未知}"
+    while true; do
+        ask new '新的 SSH 端口（回车返回）: ' && [[ -n $new ]] || return 0
+        valid_port "$new" && break
+        printf '请输入 1 到 65535 之间的整数。\n'
+    done
+    bash "$SELF" ssh change "$new" || true
+}
 menu() {
-    local choice values proto old new reply rc source columns
+    local choice reply source columns
     while true; do
         if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi
         local fw='未安装' ban='未安装' current='未知' raw
@@ -658,46 +1071,41 @@ menu() {
         columns=$(tput cols 2>/dev/null) || columns=${COLUMNS:-80}
         [[ $columns =~ ^[0-9]+$ ]] || columns=80
         menu_draw "$fw" "$ban" "$current" "$columns"
-        read -r -p '  请选择 [0-12]: ' choice || return 0
-        rc=0
+        while true; do
+            ask choice '  请选择 [0-12]: ' || return 0
+            case "$choice" in
+                0|q|Q) return 0 ;;
+                [1-9]|1[0-2]) break ;;
+                '') ;;
+                *) printf '  没有这个选项，请输入 0 到 12。\n' ;;
+            esac
+        done
         case "$choice" in
-            0) return 0 ;;
-            1) bash "$SELF" install || rc=$? ;;
-            2) bash "$SELF" status || rc=$? ;;
-            3|4)
-                read -r -p '端口（443,8000:8010）: ' values
-                read -r -p '协议 tcp / udp / both [tcp]: ' proto
-                read -r -p '来源 IP / CIDR [any 所有来源]: ' source
-                if [[ $choice == 3 ]]; then reply=add; else reply=delete; fi
-                printf '即将 %s：%s / %s，来源 %s\n' "$reply" "$values" "${proto:-tcp}" "${source:-any}"
-                read -r -p '确认？输入 yes: ' answer
-                if [[ $answer == yes ]]; then bash "$SELF" ports "$reply" "$values" "${proto:-tcp}" "${source:-any}" || rc=$?; fi ;;
-            5)
-                read -r -p '旧端口或范围: ' old
-                read -r -p '新端口或范围: ' new
-                read -r -p '协议 tcp / udp / both [tcp]: ' proto
-                read -r -p '来源 IP / CIDR [any 所有来源]: ' source
-                printf '%s → %s / %s，来源 %s\n' "$old" "$new" "${proto:-tcp}" "${source:-any}"
-                read -r -p '确认替换？输入 yes: ' answer
-                if [[ $answer == yes ]]; then bash "$SELF" ports change "$old" "$new" "${proto:-tcp}" "${source:-any}" || rc=$?; fi ;;
-            6) ss -lntup || rc=$? ;;
-            7)
-                read -r -p '输入 enable 启用，disable 停用: ' reply
-                bash "$SELF" firewall "$reply" || rc=$? ;;
-            8)
-                read -r -p '新的 SSH 端口: ' new
-                bash "$SELF" ssh change "$new" || rc=$? ;;
-            9) bash "$SELF" ssh finish || rc=$? ;;
-            10) bash "$SELF" ssh rollback || rc=$? ;;
+            1) bash "$SELF" install || true ;;
+            2) bash "$SELF" status || true ;;
+            3) menu_add ;;
+            4) menu_delete ;;
+            5) menu_change ;;
+            6) show_listeners || true ;;
+            7) menu_firewall ;;
+            8) menu_ssh_change ;;
+            9|10)
+                if [[ ! -f $PENDING_FILE ]]; then
+                    printf '\n目前没有进行中的 SSH 迁移。修改 SSH 端口请选择 8。\n'
+                elif [[ $choice == 9 ]]; then bash "$SELF" ssh finish || true
+                else bash "$SELF" ssh rollback || true; fi ;;
             11)
-                if command -v fail2ban-client >/dev/null; then fail2ban-client status sshd || true; fi
-                read -r -p '是否按 SSH 当前配置同步 Fail2ban？输入 yes: ' reply
-                if [[ $reply == yes ]]; then bash "$SELF" sync || rc=$?; fi ;;
-            12) find /var/backups -maxdepth 1 -type d -name 'vps-security*' -print ;;
-            *) printf '请选择菜单中的数字。\n' ;;
+                show_f2b
+                if (( f2b_sync )); then
+                    printf '\n'
+                    if confirm '按当前 SSH 端口重新同步 Fail2ban？' y; then bash "$SELF" sync || true; fi
+                fi ;;
+            12)
+                printf '\n'
+                find /var/backups -maxdepth 1 -type d -name 'vps-security*' -print 2>/dev/null | grep . \
+                    || printf '暂无备份。每次修改前会自动备份，只保留最近一次。\n' ;;
         esac
-        (( rc == 0 )) || printf '\n本次操作未完成（退出码 %s），请查看上面的提示。\n' "$rc"
-        read -r -p '按回车返回菜单……' reply || return 0
+        ask reply $'\n按回车返回菜单……' || return 0
     done
 }
 
@@ -709,6 +1117,7 @@ dispatch_args=()
 if (( $# == 0 )); then mode=menu; fi
 case "${1:-}" in
     install) shift ;;
+    help) usage; exit 0 ;;
     status|ssh|ports|firewall|sync)
         mode=$1; shift; dispatch_args=("$@"); set -- ;;
 esac
@@ -721,8 +1130,8 @@ while (( $# )); do
         *) die "未知参数：$1（使用 --help 查看帮助）" ;;
     esac
 done
-trap 'printf "\n操作失败（第 %s 行）。请保留当前 SSH 连接；脚本可能已完成部分配置。\n" "$LINENO" >&2' ERR
-[[ $EUID -eq 0 ]] || die '请以 root 执行，或使用 sudo bash 运行。'
+trap 'printf "\n操作中断：上面这一步执行失败（脚本第 %s 行），部分配置可能已经修改。\n请保留当前 SSH 连接，用菜单 2 查看状态后再重试。\n" "$LINENO" >&2' ERR
+[[ $EUID -eq 0 ]] || die '需要 root 权限，请用 sudo vpsfw 运行。'
 if [[ $mode == install || $mode == menu || $mode == ssh || $mode == firewall ]]; then
     [[ -t 0 ]] || die '请下载脚本后在交互终端运行，不要通过管道运行。'
 fi
@@ -730,9 +1139,10 @@ fi
 [[ ${ID:-} == debian && ${VERSION_ID:-} == 13 ]] || die '此脚本针对 Debian 13。'
 [[ -d /run/systemd/system ]] || die '需要使用 systemd 的系统。'
 
-session_port=''
-if [[ -n ${SSH_CONNECTION:-} ]]; then
-    read -r _ _ _ session_port <<< "$SSH_CONNECTION"
+session_port='' server_addr=''
+connection=$(ssh_connection)
+if [[ -n $connection ]]; then
+    read -r _ _ server_addr session_port <<< "$connection"
     valid_port "$session_port" || die '无法正确解析当前 SSH 端口。'
 fi
 if [[ $mode != menu && $mode != status ]]; then
@@ -764,7 +1174,7 @@ case "$mode" in
         start_transaction
         current=$(ssh_ports)
         write_f2b "$current"
-        systemctl enable fail2ban
+        systemctl enable --quiet fail2ban
         systemctl restart fail2ban
         wait_f2b
         effective=$(fail2ban-client get sshd action nftables-multiport port)
@@ -775,25 +1185,28 @@ case "$mode" in
         exit 0 ;;
 esac
 [[ ! -e $PENDING_FILE ]] || die '有待确认的 SSH 迁移，请先完成或回退，暂不重新初始化。'
-default_ssh=$session_port
-printf '适用范围：Debian 13，服务器宿主机的入站端口与 SSH 防护。\n'
-printf '不适用于 Docker 端口映射、NAT 转发、VPN 网关或已有复杂防火墙的服务器。\n'
-printf '保留已有 UFW 规则；备份后覆盖 /etc/fail2ban/jail.d/sshd.local。\n'
-printf '初始化不修改监听端口；SSH 端口迁移请使用菜单 8，其他端口通过菜单 3 添加。\n\n'
-if [[ -z $ssh_port ]]; then
-    read -r -p "实际 SSH 端口 [${default_ssh:-必须填写}]: " ssh_port
-    ssh_port=${ssh_port:-$default_ssh}
+if [[ -n $session_port ]]; then
+    [[ -z $ssh_port || $ssh_port == "$session_port" ]] || die "当前 SSH 连接使用 ${session_port}，--ssh-port 应填这个端口；修改 SSH 端口请用 vpsfw ssh change。"
+    ssh_port=$session_port
+elif [[ -z $ssh_port ]]; then
+    printf '当前不是通过 SSH 连接（例如服务商网页控制台），需要手动填写 SSH 端口。\n'
+    while true; do
+        ask ssh_port '服务器 SSH 端口（默认 22）: ' || cancel
+        ssh_port=${ssh_port:-22}
+        valid_port "$ssh_port" && break
+        printf '请输入 1 到 65535 之间的整数。\n'
+    done
 fi
 valid_port "$ssh_port" || die 'SSH 端口必须是 1 到 65535 的整数。'
-if [[ -n $session_port && $ssh_port != "$session_port" ]]; then
-    die "当前 SSH 连接使用 $session_port，请填写这个实际端口；修改 SSH 端口须另行操作。"
-fi
-printf '\n初始化只放行 SSH 入口（当前 %s/TCP），保留已有规则。\n' "$ssh_port"
-printf '默认拒绝其他未放行入站，允许出站，同时启用 IPv6 防护。\n'
-printf 'SSH：5 分钟内失败 5 次，封禁 SSH 端口 10 分钟。\n'
-printf '请确认 SSH 端口正确，且已准备好服务商网页控制台作为恢复入口。\n'
-read -r -p '确认适用上述场景并开始？输入 yes: ' answer
-[[ $answer == yes ]] || die '已取消，尚未修改配置。'
+printf '\n初始化将会：\n'
+printf '  · 安装 UFW 和 Fail2ban\n'
+printf '  · 放行 SSH 端口 %s/TCP，拒绝其他未放行的入站连接（IPv4 和 IPv6），出站不限\n' "$ssh_port"
+printf '  · SSH 登录 5 分钟内失败 5 次，封禁该 IP 10 分钟\n'
+printf '  · 保留已有的 UFW 规则；备份后覆盖 /etc/fail2ban/jail.d/sshd.local\n'
+printf '\n不修改 SSH 端口；其他端口初始化后用菜单 3 添加。\n'
+printf '不适合 Docker 端口映射、NAT 转发、VPN 网关或已有复杂防火墙的服务器。\n'
+printf '建议先打开服务商网页控制台备用，万一连不上可以从那里恢复。\n\n'
+confirm '开始初始化？' || cancel '没有修改任何配置'
 
 apt-get update
 apt-get install -y ufw fail2ban python3 python3-systemd nftables iproute2 util-linux
@@ -828,24 +1241,24 @@ if ! write_f2b "$all_ssh_ports"; then
 fi
 
 # Allow SSH first, including on already-active firewalls. Do not reset rules.
-ufw insert 1 allow "$ssh_port/tcp" comment 'SSH'
+allow_ssh "$ssh_port"
 IFS=, read -r -a all_ssh_array <<< "$all_ssh_ports"
-for p in "${all_ssh_array[@]}"; do ufw insert 1 allow "$p/tcp" comment 'SSH'; done
+for p in "${all_ssh_array[@]}"; do allow_ssh "$p"; done
 if grep -q '^IPV6=' /etc/default/ufw; then
     sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
 else
     printf '\nIPV6=yes\n' >> /etc/default/ufw
 fi
 # Add again after enabling IPv6 so both address families have the SSH rule.
-ufw insert 1 allow "$ssh_port/tcp" comment 'SSH'
-for p in "${all_ssh_array[@]}"; do ufw insert 1 allow "$p/tcp" comment 'SSH'; done
+allow_ssh "$ssh_port"
+for p in "${all_ssh_array[@]}"; do allow_ssh "$p"; done
 ufw default deny incoming
 ufw default allow outgoing
 ufw logging low
 ufw --force enable
 ufw reload
 
-systemctl enable fail2ban
+systemctl enable --quiet fail2ban
 if ! systemctl restart fail2ban; then
     journalctl -u fail2ban -n 50 --no-pager || true
     die "Fail2ban 重启失败。UFW 已启用；原配置备份在 $backup_dir"
@@ -864,16 +1277,12 @@ if (( ! ready )); then
     die "30 秒内 SSH 防护未就绪。UFW 已启用；原配置备份在 $backup_dir"
 fi
 
-printf '\n===== UFW 状态 =====\n'
-ufw status verbose
-printf '\n===== Fail2ban SSH 状态 =====\n'
-fail2ban-client status sshd
-printf '\n===== 实际启用的封禁动作 =====\n'
-fail2ban-client get sshd actions
+printf '\n── 防火墙规则 ──\n'
+ufw status
 prune_backups
-printf '\n配置完成。备份：%s\n' "$backup_dir"
-printf '请保留当前窗口，新开 SSH 连接测试登录。\n'
-printf '其他服务端口通过菜单 3 添加；服务商安全组需同步放行。\n'
-printf '旧的 UFW 放行规则会保留。更换端口后请检查：ufw status numbered\n'
-printf '恢复访问：在原会话或服务商控制台执行 ufw disable\n'
-printf '如被 Fail2ban 误封：fail2ban-client set sshd unbanip 你的公网IP\n'
+printf '\n初始化完成：防火墙已启用，Fail2ban 正在保护 SSH 端口 %s。\n\n' "$all_ssh_ports"
+printf '接下来：\n'
+printf '  1. 不要关闭当前窗口，新开一个终端确认还能登录：%s\n' "$(ssh_login_hint "$ssh_port")"
+printf '  2. 网站、数据库等其他端口，用菜单 3 添加放行（服务商安全组也要放行）\n\n'
+printf '万一连不上：在当前窗口或服务商控制台执行 ufw disable 关闭防火墙；\n'
+printf '如果是自己的 IP 被误封：fail2ban-client set sshd unbanip 你的公网IP\n'

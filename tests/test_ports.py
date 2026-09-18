@@ -30,6 +30,7 @@ import json,sys
 with open(sys.argv[1],'a') as f: f.write(json.dumps(sys.argv[2:])+"\n")
 LOG
     if [[ ${FAIL_UDP:-0} == 1 && $* == *udp* ]]; then return 1; fi
+    if [[ ${FAIL_INSERT:-0} == 1 && $1 == insert ]]; then return 1; fi
 }
 ssh_ports() { echo 34968; }
 ss() { :; }
@@ -167,5 +168,26 @@ ssh_port=''
         result=self.run_script('ports_command list')
         self.assertIn('old app',result.stdout)
         self.assertEqual(self.commands(),[])
+
+    def test_loose_input_formats(self):
+        self.run_script("ports_command add '443， 8000-8010' TCP")
+        self.assertEqual([c[1] for c in self.commands()],['443/tcp','8000:8010/tcp'])
+
+    def test_rule_listing_skips_complex_rules(self):
+        self.seed(source='192.0.2.8',comment='db')
+        with self.rules.open('a') as f: f.write("ufw allow 80,443/tcp\nufw allow out 53/udp\n")
+        result=self.run_script('load_rules; rule_info --list')
+        self.assertEqual(result.stdout,'443\ttcp\t192.0.2.8\tdb\n')
+        result=self.run_script('load_rules; rule_info --other')
+        self.assertEqual(result.stdout,'ufw allow 80,443/tcp\nufw allow out 53/udp\n')
+
+    def test_ssh_rule_falls_back_when_rule_set_empty(self):
+        self.run_script('allow_ssh 2222',extra='FAIL_INSERT=1')
+        self.assertEqual(self.commands()[-1],['allow','2222/tcp','comment','SSH'])
+
+    def test_delete_reports_rules_still_open(self):
+        self.seed(port='8000:8010');self.seed(port='8005')
+        result=self.run_script('ports_command delete 8005')
+        self.assertIn('8000:8010/tcp',result.stdout)
 
 if __name__=='__main__': unittest.main()
