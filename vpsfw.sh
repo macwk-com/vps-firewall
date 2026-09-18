@@ -579,7 +579,26 @@ menu_draw() {
         wide=0; menu_span=$((columns - 4))
         (( menu_span >= 24 )) || menu_span=24
     fi
-    printf '\n  %sV P S F W%s\n' "$cyan$bold" "$reset"
+    printf '\n'
+    if (( wide )); then
+        printf '%s' "$cyan"
+        printf '  __   ______  ____     ____  _   _ ___ _____ _     ____  \n'
+        printf '  \\ \\ / /  _ \\/ ___|   / ___|| | | |_ _| ____| |   |  _ \\ \n'
+        printf '   \\ V /| |_) \\___ \\   \\___ \\| |_| || ||  _| | |   | | | |\n'
+        printf '    \\_/ | .__/|____/   |____/ \\___/|___|_____|_____|____/ \n'
+        printf '        |_|%s\n' "$reset"
+    else
+        printf '%s' "$cyan"
+        cat <<'LOGO'
+  __   ______  ____
+  \ \ / /  _ \/ ___|
+   \ V /| |_) \___ \
+    \_/ | .__/|____/
+        |_|
+LOGO
+        printf '%s' "$reset"
+    fi
+    printf '\n  %sVPS Firewall  ·  Debian 13%s\n' "$bold" "$reset"
     printf '  %s服务器端口与 SSH 管理%s\n\n' "$dim" "$reset"
     menu_rule
     if (( wide )); then
@@ -601,16 +620,16 @@ menu_draw() {
             menu_item "$((i+1))" "$left"
             printf '%*s    ' "$padding" ''
             # The first column already supplied the row indentation.
-            printf '%s%2s.%s %s\n' "$cyan" "$((i+7))" "$reset" "$right"
+            printf '%s%2s.%s %s\n\n' "$cyan" "$((i+7))" "$reset" "$right"
         done
     else
         printf '  %s端口管理%s\n\n' "$dim" "$reset"
         for ((i=0;i<12;i++)); do
             if (( i == 6 )); then printf '\n  %s防护与 SSH%s\n\n' "$dim" "$reset"; fi
-            menu_item "$((i+1))" "${labels[i]}"; printf '\n'
+            menu_item "$((i+1))" "${labels[i]}"; printf '\n\n'
         done
     fi
-    printf '\n'; menu_rule
+    menu_rule
     menu_item 0 '退出'; printf '\n'; menu_rule
     if [[ -f $PENDING_FILE ]]; then
         printf '\n  %sSSH 迁移待确认%s\n  请从新端口登录，再选择 9。\n' "$cyan" "$reset"
