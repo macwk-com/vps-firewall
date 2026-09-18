@@ -9,7 +9,7 @@ fail() { printf '\n安装失败：%s\n' "$*" >&2; exit 1; }
 [[ ${ID:-} == debian && ${VERSION_ID:-} == 13 ]] || fail '目前支持 Debian 13。'
 command -v curl >/dev/null || fail '请先安装 curl 和 ca-certificates。'
 
-source_url='https://raw.githubusercontent.com/macwk-com/vps-firewall/main/vpsfw.sh'
+repo='macwk-com/vps-firewall'
 install_dir=/usr/local/bin
 destination=$install_dir/vpsfw
 mkdir -p "$install_dir"
@@ -25,9 +25,21 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf '正在下载 VPS Firewall……\n'
+# raw.githubusercontent.com caches main for 5 minutes; download by commit so a fresh push is picked up.
+# The API answer is cached for at most 60 seconds. Fall back to main if it is unreachable or rate limited.
+commit=$(curl --proto '=https' --connect-timeout 10 --max-time 20 -fsS \
+    -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/$repo/commits/main" 2>/dev/null) || commit=''
+if [[ $commit =~ ^[0-9a-f]{40}$ ]]; then
+    ref=$commit
+    printf '正在下载 VPS Firewall（最新提交 %s）……\n' "${commit:0:7}"
+else
+    ref=main
+    printf '正在下载 VPS Firewall……\n'
+    printf '（暂时查不到最新提交，改用 main 分支地址；刚推送的更新可能要等 5 分钟才能下载到。）\n'
+fi
+source_url="https://raw.githubusercontent.com/$repo/$ref/vpsfw.sh"
 curl --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 120 \
-    --retry 2 -fSL "$source_url" -o "$download" || fail '下载失败，请确认仓库公开、main 分支存在且 vpsfw.sh 位于根目录。'
+    --retry 2 -fsSL "$source_url" -o "$download" || fail '下载失败，请确认仓库公开、main 分支存在且 vpsfw.sh 位于根目录。'
 [[ -s $download ]] || fail '下载结果为空。'
 grep -Fq '# VPS Firewall —' "$download" || fail '下载内容不是预期的 VPS Firewall 脚本。'
 bash -n "$download" || fail '下载的脚本没有通过 Bash 语法检查。'
