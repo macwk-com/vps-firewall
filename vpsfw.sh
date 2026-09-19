@@ -30,11 +30,14 @@ VPS Firewall — Linux 服务器安全与端口管理
   vpsfw                              # 彩色菜单
   vpsfw install                      # 初始化 UFW + Fail2ban
   vpsfw --ssh-port 34968              # 使用现有 SSH 端口初始化
-  vpsfw ports list                   # 已保存规则及生效状态
-  vpsfw ports add 443,8000:8010 tcp    # 单端口、范围、逗号列表
-  vpsfw ports add 5432 tcp 192.0.2.8  # 只允许指定来源
-  vpsfw ports delete 5432 tcp 192.0.2.8
-  vpsfw ports change 443 8443 tcp     # 先放行新端口，再删除旧规则
+  vpsfw ports list                   # 每个端口谁能访问
+  vpsfw ports set 443,8000-8010 tcp any       # 放行端口，所有 IP 都能访问
+  vpsfw ports set 5432 tcp 192.0.2.8,198.51.100.0/24
+                                     # 只允许这些 IP 访问（白名单）
+  vpsfw ports add 5432 tcp 203.0.113.9        # 往白名单里再加一个 IP
+  vpsfw ports delete 5432 tcp 203.0.113.9     # 从白名单里去掉一个 IP
+  vpsfw ports change 443 8443 tcp    # 换端口号，谁能访问保持不变
+  vpsfw ports close 5432 tcp         # 关闭端口（删掉它的全部放行规则）
   vpsfw status
   vpsfw ssh change 38217             # 开启新旧双端口并同步防护
   vpsfw ssh finish                   # 新端口登录后关闭旧入口
@@ -48,12 +51,11 @@ VPS Firewall — Linux 服务器安全与端口管理
   vpsfw firewall enable|disable
   vpsfw help                         # 显示本帮助
 
-ports add/delete 端口列表 [tcp|udp|both] [来源IP/CIDR|any]
-ports change 旧端口或范围 新端口或范围 [tcp|udp|both] [来源IP/CIDR|any]
-默认协议 tcp，默认来源 any（所有来源）；范围写 8000:8010 或 8000-8010。
-删除/替换按端口、协议和来源精确匹配普通入站放行规则，无需专用标记。
-范围规则须整体删除；SSH 入口通过专用菜单管理。
-初始化仅放行 SSH，其他端口通过端口管理添加。保留已有 UFW 规则。
+ports set 端口列表 协议 来源列表|any：来源用逗号分隔，any 表示所有 IP。
+ports add/delete 端口列表 [协议] [来源]：加一条或删一条来源，来源默认 any。
+协议是 tcp、udp 或 both（两者都要），默认 tcp；范围写 8000:8010 或 8000-8010。
+SSH 端口可以用 ports set 限制来源（必须包含当前连接的 IP）；换 SSH 端口用 ssh change。
+初始化仅放行 SSH，其他端口通过端口访问管理放行。保留已有 UFW 规则。
 适用 Debian 10–14、Ubuntu 18.04–26.04、Rocky / AlmaLinux 8–10 宿主机入站流量；不管理应用、容器映射和路由转发。
 SSH 迁移支持系统自带的 SSH 服务（含 Ubuntu 的 socket 模式），保留新旧入口直到新会话确认。
 HELP
@@ -115,6 +117,8 @@ load_rules() { rules=$(ufw show added); }
 # Parse only simple inbound allow rules. No eval or execution of rule text.
 # `rule_info --list` prints them as port<TAB>proto<TAB>source<TAB>comment;
 # `rule_info --other` prints the remaining rule lines unchanged;
+# `rule_info --access SSH端口列表` groups them per port as port<TAB>proto<TAB>sources<TAB>is-SSH, proto
+# "both" when TCP and UDP let in the same comma-separated sources;
 # `rule_info --cover` prints port<TAB>proto<TAB>source for every port rule, including port lists
 # such as 80,443 and rules without a protocol (proto "any"), to tell whether a port is reachable;
 # `rule_info 端口 协议 来源` prints the matching rule's comment (1 = none, 2 = ambiguous).
@@ -169,6 +173,26 @@ if sys.argv[1]=="--cover":
 if sys.argv[1]=="--other":
     if other: print("\n".join(other))
     sys.exit(0)
+if sys.argv[1]=="--access":
+    ssh=set(sys.argv[2].split(","))
+    groups={}
+    for row in rows:
+        if listable(row): groups.setdefault(row[:2],set()).add(row[2])
+    def order(s):
+        if s=="any": return (0,0,0,0)
+        n=ipaddress.ip_network(s)
+        return (1,n.version,int(n.network_address),n.prefixlen)
+    entries=[[rp,rproto,",".join(sorted(srcs,key=order)),int(rproto=="tcp" and rp in ssh)]
+             for (rp,rproto),srcs in groups.items()]
+    # One line per port when TCP and UDP let in the same sources.
+    merged=[]
+    for e in entries:
+        twin=[o for o in entries if o[0]==e[0] and o[1]!=e[1] and o[2]==e[2] and not o[3] and not e[3]]
+        if not twin: merged.append(e)
+        elif e[1]=="tcp": merged.append([e[0],"both",e[2],0])
+    merged.sort(key=lambda e:(int(e[0].split(":")[0]),int(e[0].split(":")[-1]),("tcp","udp","both").index(e[1])))
+    for e in merged: print("\t".join(map(str,e)))
+    sys.exit(0)
 matches=[row[3] for row in rows if row[:3]==tuple(sys.argv[1:4])]
 if len(matches)>1:
     print("精确匹配规则不唯一，请先用 ufw show added 检查",file=sys.stderr); sys.exit(2)
@@ -189,7 +213,43 @@ covering_rules() {
         printf '      %s/%s  来源 %s\n' "$rp" "$rproto" "$(source_label "$rsource")"
     done < <(rule_info --list)
 }
-source_label() { if [[ $1 == any ]]; then printf '所有来源'; else printf '%s' "$1"; fi; }
+source_label() { if [[ $1 == any ]]; then printf '所有 IP'; else printf '%s' "$1"; fi; }
+# Sources let in on one exact port and protocol, one per line: "any" or an address.
+port_sources() {
+    rule_info --list | awk -F'\t' -v p="$1" -v proto="$2" '$1 == p && $2 == proto {print $3}' | sort -u
+}
+# REPLY becomes "所有 IP" or the allowed addresses, shortened to about $2 terminal cells.
+access_label() {
+    local sources=$1 width=${2:-40} items text
+    if [[ ,$sources, == *,any,* ]]; then REPLY='所有 IP'; return 0; fi
+    IFS=, read -r -a items <<< "$sources"
+    text="只允许 ${sources//,/、}"
+    menu_width "$text"
+    (( REPLY <= width )) || text="只允许 ${#items[@]} 个 IP：${items[0]} 等"
+    REPLY=$text
+}
+# Sources separated by commas or spaces, normalised and comma-joined; "any" has to stand alone.
+normalize_sources() {
+    local value=${1//，/,} item out='' items=()
+    read -r -a items <<< "${value//,/ }"
+    for item in ${items[@]+"${items[@]}"}; do
+        item=$(normalize_source "$item") || return 1
+        [[ ,$out, == *,"$item",* ]] || out+=${out:+,}$item
+    done
+    [[ -n $out ]] || { printf '没有填写来源\n' >&2; return 1; }
+    [[ $out == any || ,$out, != *,any,* ]] || { printf 'any（所有 IP）不能和具体的 IP 写在一起\n' >&2; return 1; }
+    printf '%s' "$out"
+}
+# Refuse a source list for SSH port $1 that leaves out the address of this SSH session.
+check_session_allowed() {
+    [[ -n ${client_addr:-} && $1 == "${session_port:-}" ]] || return 0
+    python3 - "$client_addr" "$2" <<'PY' || die "你现在是从 $client_addr 连上来的，它不在名单里：当前窗口不会断，但以后就登录不上了。名单里要有这个 IP。"
+import ipaddress, sys
+a = ipaddress.ip_address(sys.argv[1].split('%')[0])
+if a.version == 6 and a.ipv4_mapped: a = a.ipv4_mapped
+sys.exit(not any(s == 'any' or a in ipaddress.ip_network(s) for s in sys.argv[2].split(',') if s))
+PY
+}
 proto_label() {
     case "$1" in tcp) printf 'TCP' ;; udp) printf 'UDP' ;; *) printf 'TCP+UDP' ;; esac
 }
@@ -203,33 +263,74 @@ check_ssh_collision() {
     for p in "${protected[@]}"; do
         [[ -n $p ]] || continue
         if (( 10#$p >= 10#$first && 10#$p <= 10#$last )); then
-            [[ $spec == *:* ]] || die "$spec 是 SSH 端口，请用菜单 8「修改 SSH 端口」管理。"
-            die "端口范围 ${spec/:/-} 包含 SSH 端口 ${p}，请拆开填写，SSH 端口用菜单 8 管理。"
+            [[ $spec == *:* ]] || die "$spec 是 SSH 端口，换端口请到「SSH 管理 → 修改 SSH 端口」，限制来源用 ports set。"
+            die "端口范围 ${spec/:/-} 包含 SSH 端口 ${p}，请拆开填写，SSH 端口在「SSH 管理」里改。"
         fi
     done
     listeners=$(ss -H -lntp "sport >= :$first and sport <= :$last") || die '无法检查实际监听端口。'
-    [[ $listeners != *'"sshd"'* && $listeners != *'"sshd-session"'* ]] || die "端口 ${spec/:/-} 正由 SSH 使用，请用菜单 8 管理。"
+    [[ $listeners != *'"sshd"'* && $listeners != *'"sshd-session"'* ]] || die "端口 ${spec/:/-} 正由 SSH 使用，请到「SSH 管理」里改。"
 }
+# port_rule add|delete 端口 协议 来源 [备注]; the comment defaults to "VPS TCP" or "VPS UDP".
 port_rule() {
-    local op=$1 port=$2 proto=$3 source=$4
+    local op=$1 port=$2 proto=$3 source=$4 comment=${5:-}
     local args=()
     [[ $op != delete ]] || args+=(--force delete)
     args+=(allow)
     if [[ $source == any ]]; then args+=("$port/$proto")
     else args+=(from "$source" to any port "$port" proto "$proto"); fi
     if [[ $op != delete ]]; then
-        if [[ $proto == tcp ]]; then args+=(comment 'VPS TCP'); else args+=(comment 'VPS UDP'); fi
+        [[ -n $comment ]] || comment="VPS ${proto^^}"
+        args+=(comment "$comment")
     fi
+    # SSH rules go first so no later deny rule can shadow them. `ufw insert 1` fails on an empty rule
+    # set (fresh server) and for an IPv6 rule ahead of IPv4 ones, so fall back to a plain allow.
+    if [[ $comment == SSH ]] && ufw insert 1 "${args[@]}" >/dev/null 2>&1; then return 0; fi
     ufw "${args[@]}" >/dev/null
 }
-# `ufw insert 1` fails on an empty rule set (fresh server), so fall back to a plain allow.
+# Open an SSH port to all IPs, unless it is limited to a whitelist.
 allow_ssh() {
-    ufw insert 1 allow "$1/tcp" comment 'SSH' >/dev/null 2>&1 || ufw allow "$1/tcp" comment 'SSH' >/dev/null
+    local sources
+    load_rules
+    sources=$(port_sources "$1" tcp)
+    [[ -z $sources || $'\n'$sources$'\n' == *$'\n'any$'\n'* ]] || return 0
+    port_rule add "$1" tcp any SSH
 }
-list_ports() {
-    printf '\n── 所有已保存规则 ──\n%s\n' "$rules"
-    printf '\n── 实际防火墙状态 ──\n'
-    ufw status numbered
+# Sources of the SSH-labelled rules of a port.
+ssh_rule_sources() {
+    load_rules
+    rule_info --list | awk -F'\t' -v p="$1" '$1 == p && $2 == "tcp" && $4 == "SSH" {print $3}'
+}
+delete_ssh_rules() {
+    local source
+    for source in $(ssh_rule_sources "$1"); do port_rule delete "$1" tcp "$source" || return 1; done
+}
+# The whitelist shared by SSH ports $1 (comma list), or nothing when any of them is open to all IPs.
+ssh_whitelist() {
+    local p sources all=''
+    load_rules
+    for p in ${1//,/ }; do
+        sources=$(port_sources "$p" tcp)
+        [[ -n $sources && $'\n'$sources$'\n' != *$'\n'any$'\n'* ]] || return 0
+        all+=$sources$'\n'
+    done
+    printf '%s' "$all" | sort -u | paste -sd, -
+}
+# Add, then delete, the rules that make spec/protocol let in exactly the sources in $3
+# (comma list, empty for none). Rules added here carry comment $4.
+sync_sources() {
+    local spec=$1 protocol=$2 target=$3 comment=${4:-} current source
+    load_rules
+    current=$(port_sources "$spec" "$protocol")
+    for source in ${target//,/ }; do
+        [[ $'\n'$current$'\n' != *$'\n'"$source"$'\n'* ]] || continue
+        port_rule add "$spec" "$protocol" "$source" "$comment"
+        printf '  ✓ %s/%s  允许 %s\n' "${spec/:/-}" "$protocol" "$(source_label "$source")"
+    done
+    for source in $current; do
+        [[ ,$target, != *,"$source",* ]] || continue
+        port_rule delete "$spec" "$protocol" "$source"
+        printf '  ✓ %s/%s  移除 %s\n' "${spec/:/-}" "$protocol" "$(source_label "$source")"
+    done
 }
 backup_ufw() {
     backup_dir=$(mktemp -d /var/backups/vps-security.XXXXXXXX)
@@ -535,25 +636,24 @@ ssh_login_hint() {
     printf 'ssh -p %s %s@%s' "$1" "${2:-${SUDO_USER:-$(logname 2>/dev/null || id -un)}}" "$host"
 }
 ssh_change() {
-    local new=$1 old combined comment lookup_status
+    local new=$1 old combined whitelist source
     valid_port "$new" || die '请输入 1 到 65535 的端口。'
     ssh_preflight
     old=$(ssh_ports)
     [[ ,$old, != *,$new,* ]] || die '该端口已经是 SSH 监听端口。'
     [[ -z $(ss -H -lnt "sport = :$new") ]] || die '新 TCP 端口已被其他程序使用。'
     load_rules
-    if comment=$(rule_info "$new" tcp any); then
-        [[ $comment == SSH ]] || die '新端口已有普通 TCP 放行规则，请先确认用途并删除该规则。'
-    else
-        lookup_status=$?
-        (( lookup_status == 1 )) || die '新端口规则不明确，请先检查。'
-    fi
+    [[ -z $(rule_info --list | awk -F'\t' -v p="$new" '$1 == p && $2 == "tcp" && $4 != "SSH"') ]] ||
+        die "新端口 $new 已有普通 TCP 放行规则，请先确认用途，在「端口访问管理」里关闭它。"
+    whitelist=$(ssh_whitelist "$old")
     printf '\nSSH 端口：%s → %s\n' "$old" "$new"
     printf '迁移分两步：先让新旧端口同时可用；你用新端口登录成功后，再关闭旧端口。\n'
+    [[ -z $whitelist ]] || printf '新端口沿用 SSH 现在的来源限制：只允许 %s。\n' "${whitelist//,/、}"
     printf '开始前请确认：服务商安全组（云防火墙）已放行 %s/TCP，并且不要关闭当前窗口。\n\n' "$new"
     confirm '开始第一步？' || cancel '没有修改任何配置'
     ssh_snapshot
     start_transaction
+    for source in ${whitelist//,/ }; do port_rule add "$new" tcp "$source" SSH; done
     combined=$(printf '%s,%s\n' "$old" "$new" | tr ',' '\n' | sort -nu | paste -sd, -)
     apply_ssh_ports "$combined"
     mkdir -p "$STATE_DIR"
@@ -563,14 +663,14 @@ ssh_change() {
     prune_backups
     printf '\n第一步完成：新端口 %s 已开始监听，旧端口 %s 仍然可用，Fail2ban 同时保护两者。\n\n' "$new" "$old"
     printf '下一步：保留当前窗口，在你自己电脑上新开一个终端执行：\n\n    %s\n\n' "$(ssh_login_hint "$new")"
-    printf '登录成功后，在新窗口里运行 vpsfw，选择 8，再选「确认迁移」。\n'
-    printf '如果新端口连不上，回到当前窗口选择 8，再选「回退迁移」。\n'
+    printf '登录成功后，在新窗口里运行 vpsfw，进入「SSH 管理 → 完成端口迁移」，选「确认迁移」。\n'
+    printf '如果新端口连不上，回到当前窗口，在同一个地方选「回退迁移」。\n'
 }
 ssh_finish() {
     read_pending
     if [[ ${session_port:-} != "$pending_new" ]]; then
         printf '\n当前窗口是通过 %s 连接的，不能在这里确认。\n' "${session_port:-控制台}" >&2
-        printf '请先用新端口登录（%s），在新窗口里选择 8 确认。\n' "$(ssh_login_hint "$pending_new")" >&2
+        printf '请先用新端口登录（%s），在新窗口里到「SSH 管理」确认。\n' "$(ssh_login_hint "$pending_new")" >&2
         printf '这样可以证明新端口确实能连上，避免把自己锁在外面。\n' >&2
         exit 1
     fi
@@ -583,14 +683,9 @@ ssh_finish() {
     # Commit before optional rule cleanup; a cleanup failure must not reopen old SSH listeners.
     end_transaction
     rm -f "$PENDING_FILE"
-    load_rules
     local p
     IFS=, read -r -a old_array <<< "$pending_old"
-    for p in "${old_array[@]}"; do
-        if [[ $'\n'$rules$'\n' == *$'\n'"ufw allow $p/tcp comment 'SSH'"$'\n'* ]]; then
-            ufw --force delete allow "$p/tcp" comment 'SSH' >/dev/null
-        fi
-    done
+    for p in "${old_array[@]}"; do delete_ssh_rules "$p"; done
     prune_backups
     printf '\n迁移完成：SSH 只监听 %s，Fail2ban 已同步，旧端口 %s 已关闭。\n' "$pending_new" "$pending_old"
     printf '记得在服务商安全组里删除旧端口 %s 的放行。\n' "$pending_old"
@@ -604,17 +699,16 @@ ssh_rollback() {
     backup_dir=$pending_backup
     printf '已回退：SSH 和 Fail2ban 恢复为迁移前的配置（端口 %s）。\n' "$pending_old"
     # Cleanup only after SSH is back on the old port; a rule that predates the migration stays.
-    load_rules
-    if [[ $'\n'$rules$'\n' != *$'\n'"ufw allow $pending_new/tcp comment 'SSH'"$'\n'* ]]; then
+    if [[ -z $(ssh_rule_sources "$pending_new") ]]; then
         :
     elif grep -qs "^### tuple ### allow tcp $pending_new " "$pending_backup/ufw/user.rules" "$pending_backup/ufw/user6.rules"; then
         printf '%s/tcp 的放行规则在迁移前就已存在，保留不动。\n' "$pending_new"
     elif ! (verify_ssh_ports "$pending_old") 2>/dev/null; then
         printf '旧端口 %s 没有确认恢复监听，%s/tcp 的放行规则先保留，请检查后手动处理。\n' "$pending_old" "$pending_new" >&2
-    elif ufw --force delete allow "$pending_new/tcp" comment 'SSH' >/dev/null; then
+    elif delete_ssh_rules "$pending_new"; then
         printf '已删除 %s/tcp 的防火墙放行；服务商安全组里的这条放行也可以删掉。\n' "$pending_new"
     else
-        printf '删除 %s/tcp 的防火墙放行失败，请手动执行：ufw delete allow %s/tcp\n' "$pending_new" "$pending_new" >&2
+        printf '删除 %s/tcp 的防火墙放行失败，请用 ufw status numbered 查看后手动删除。\n' "$pending_new" >&2
     fi
     prune_backups
 }
@@ -663,10 +757,9 @@ print_banned() {
     } END { if (line != "") print line }'
     (( total <= 30 )) || printf '  %s……共 %s 个，只显示前 30 个%s\n' "$c_dim" "$total" "$c_off"
 }
-show_status() {
-    set_colors
-    local raw fw='● 未安装' fw_color=$c_err fw_note='请先初始化（菜单 1）' policy_in policy_out ipv6
-    local ssh ssh_color='' ssh_note f2b_note rows others count rp rproto rsource rcomment
+# Status rows shared by the status page and the firewall menu.
+firewall_row() {
+    local raw fw='● 未安装' color=$c_err note='请先初始化（主菜单 1）' policy_in policy_out ipv6
     if command -v ufw >/dev/null; then
         raw=$(ufw status 2>/dev/null) || raw=''
         policy_in=$(sed -n 's/^DEFAULT_INPUT_POLICY="\(.*\)"$/\1/p' /etc/default/ufw)
@@ -675,50 +768,75 @@ show_status() {
         if [[ $policy_in == ACCEPT ]]; then policy_in='默认放行所有入站'; else policy_in='拒绝未放行的入站'; fi
         if [[ $policy_out == ACCEPT ]]; then policy_out='允许出站'; else policy_out='限制出站'; fi
         case "$raw" in
-            'Status: active'*) fw='● 已启用'; fw_color=$c_ok; fw_note="$policy_in · $policy_out · $ipv6" ;;
-            'Status: inactive'*) fw='● 未启用'; fw_color=$c_warn; fw_note='下面的规则已保存，启用后才生效（菜单 7）' ;;
-            *) fw='● 状态异常'; fw_note='请运行 ufw status 查看' ;;
+            'Status: active'*) fw='● 已启用'; color=$c_ok; note="$policy_in · $policy_out · $ipv6" ;;
+            'Status: inactive'*) fw='● 未启用'; color=$c_warn; note='所有端口都对外开放；放行规则已保存，启用后才生效' ;;
+            *) fw='● 状态异常'; color=$c_warn; note='请运行 ufw status 查看' ;;
         esac
     fi
+    status_row 防火墙 "$fw" "$color" "$note"
+}
+ping_row() {
+    command -v ufw >/dev/null || return 0
+    ping_state
+    case $REPLY in
+        blocked) status_row Ping '● 已禁止' "$c_ok" '别人 ping 不通这台服务器' ;;
+        allowed) status_row Ping '允许' '' '别人可以 ping 通这台服务器' ;;
+        mixed) status_row Ping '● 部分禁止' "$c_warn" 'IPv4 和 IPv6 的设置不一致' ;;
+        *) status_row Ping '未知' "$c_warn" 'UFW 的 ping 规则被手动改过' ;;
+    esac
+}
+# Group the allow rules per port into access_entries: port<TAB>proto<TAB>sources<TAB>is-SSH.
+access_load() {
+    local ssh line
+    load_rules
     ssh=$(ssh_ports 2>/dev/null) || ssh=''
-    if [[ -f $PENDING_FILE ]]; then ssh_color=$c_warn; ssh_note='迁移待确认：请从新端口登录后选 8'
+    access_entries=()
+    while IFS= read -r line; do
+        [[ -z $line ]] || access_entries+=("$line")
+    done < <(rule_info --access "$ssh${session_port:+,$session_port}")
+}
+# Who can reach each port; numbered when $1 is 1.
+access_print() {
+    local numbered=${1:-0} line rp rproto rsources rssh name who n=0
+    if (( ${#access_entries[@]} == 0 )); then printf '  %s还没有放行任何端口%s\n' "$c_dim" "$c_off"; return 0; fi
+    printf '  %s' "$c_dim"
+    (( ! numbered )) || pad 编号 6
+    printf '%s%s谁能访问%s\n' "$(pad 端口 14)" "$(pad 协议 9)" "$c_off"
+    for line in "${access_entries[@]}"; do
+        IFS=$'\t' read -r rp rproto rsources rssh <<< "$line"
+        n=$((n + 1)); name=${rp/:/-}
+        (( ! rssh )) || name+=' (SSH)'
+        access_label "$rsources" 44; who=$REPLY
+        printf '  '
+        (( ! numbered )) || pad "$n" 6
+        printf '%s%s%s\n' "$(pad "$name" 14)" "$(pad "$(proto_label "$rproto")" 9)" "$who"
+    done
+}
+show_status() {
+    set_colors
+    local ssh ssh_color='' ssh_note f2b_note others
+    ssh=$(ssh_ports 2>/dev/null) || ssh=''
+    if [[ -f $PENDING_FILE ]]; then ssh_color=$c_warn; ssh_note='迁移待确认：从新端口登录后到「SSH 管理」确认'
     elif [[ -n ${session_port:-} ]]; then ssh_note="当前连接 $session_port"
     else ssh_note='当前在控制台'; fi
     read_f2b
     case "$f2b_state" in
         *保护中) f2b_note="封禁中 $(f2b_field 'Currently banned') 个 · 累计 $(f2b_field 'Total banned') 次" ;;
-        *未运行) f2b_note='SSH 登录保护没有运行，可在菜单 9 同步' ;;
-        *) f2b_note='请先初始化（菜单 1）' ;;
+        *未运行) f2b_note='SSH 登录保护没有运行，可在「Fail2ban 管理」里同步' ;;
+        *) f2b_note='请先初始化（主菜单 1）' ;;
     esac
 
     section '防护状态'
-    status_row 防火墙 "$fw" "$fw_color" "$fw_note"
+    firewall_row
     status_row SSH "${ssh:-未知}" "$ssh_color" "$ssh_note"
     status_row Fail2ban "$f2b_state" "$f2b_color" "$f2b_note"
-    if command -v ufw >/dev/null; then
-        ping_state
-        case $REPLY in
-            blocked) status_row Ping '● 已禁止' "$c_ok" '别人 ping 不通这台服务器' ;;
-            allowed) status_row Ping '允许' '' '需要时可在菜单 12 禁止' ;;
-            mixed) status_row Ping '● 部分禁止' "$c_warn" 'IPv4 和 IPv6 的设置不一致' ;;
-            *) status_row Ping '未知' "$c_warn" 'UFW 的 ping 规则被手动改过' ;;
-        esac
-    fi
+    ping_row
 
     if command -v ufw >/dev/null; then
-        load_rules
-        rows=$(rule_info --list); others=$(rule_info --other)
-        count=0; [[ -z $rows ]] || count=$(wc -l <<< "$rows")
-        section "放行规则（$count 条）"
-        if (( count == 0 )); then
-            printf '  %s无%s\n' "$c_dim" "$c_off"
-        else
-            printf '  %s%s%s%s备注%s\n' "$c_dim" "$(pad 端口 12)" "$(pad 协议 6)" "$(pad 来源 20)" "$c_off"
-            while IFS=$'\t' read -r rp rproto rsource rcomment; do
-                printf '  %s%s%s %s%s%s\n' "$(pad "$rp" 12)" "$(pad "$(proto_label "$rproto")" 6)" \
-                    "$(pad "$(source_label "$rsource")" 19)" "$c_dim" "$rcomment" "$c_off"
-            done <<< "$rows"
-        fi
+        access_load
+        section "端口访问（${#access_entries[@]} 个）"
+        access_print
+        others=$(rule_info --other)
         if [[ -n $others ]]; then
             section '其他规则（不在本工具管理范围，原样显示）'
             printf '%s\n' "$others" | sed "s/^/  $c_dim/; s/\$/$c_off/"
@@ -730,17 +848,17 @@ show_status() {
     fi
     printf '\n'
 }
-# Fail2ban details for menu 11; sets f2b_sync=1 when the jail needs resyncing.
+# Fail2ban details for its menu; sets f2b_sync=1 when the jail needs resyncing.
 show_f2b() {
     set_colors
     read_f2b
     local ssh ports maxretry findtime bantime
     f2b_sync=0
     ssh=$(ssh_ports 2>/dev/null) || ssh=''
-    section 'Fail2ban · SSH 登录保护'
+    printf '\n'
     if [[ -z $f2b_status ]]; then
         if [[ $f2b_state == *未安装 ]]; then
-            status_row 状态 "$f2b_state" "$f2b_color" '请先初始化（菜单 1）'
+            status_row 状态 "$f2b_state" "$f2b_color" '请先初始化（主菜单 1）'
         else
             status_row 状态 "$f2b_state" "$f2b_color" 'SSH 登录保护没有运行'
             f2b_sync=1
@@ -944,17 +1062,7 @@ ping_switch() {
     fi
     prune_backups
     if [[ $want == off ]]; then printf '已禁止 ping。\n'; else printf '已恢复响应 ping。\n'; fi
-    [[ $(ufw status) == 'Status: active'* ]] || printf '防火墙当前未启用，设置已保存，启用后才生效（菜单 7）。\n'
-}
-menu_ping() {
-    command -v ufw >/dev/null || { printf '\n还没有初始化，请先选择 1。\n'; return 0; }
-    ping_state
-    case $REPLY in
-        allowed) printf '\n现在：服务器响应 ping。\n'; bash "$SELF" ping off || true ;;
-        blocked) printf '\n现在：服务器不响应 ping。\n'; bash "$SELF" ping on || true ;;
-        mixed) printf '\n现在：IPv4 和 IPv6 的设置不一致。\n'; bash "$SELF" ping off || true ;;
-        *) printf '\nUFW 的 ping 规则被手动改过，无法自动修改。\n' ;;
-    esac
+    [[ $(ufw status) == 'Status: active'* ]] || printf '防火墙当前未启用，设置已保存，启用防火墙后才生效。\n'
 }
 # ── SSH login methods: account passwords, public keys and whether password login is allowed. ──
 AUTH_CONF=/etc/ssh/sshd_config.d/00-vpsfw-auth.conf
@@ -1028,13 +1136,24 @@ elif op == 'remove':
 PY
 }
 key_count() { { key_tool list "$(user_home "$1")/.ssh/authorized_keys" || true; } | wc -l; }
-# Status block of menu 11 for one account.
-auth_status() {
-    local user=$1 pa root_login how
-    set_colors
+# Header of the SSH menu: port, who may log in, password login and this connection.
+ssh_status() {
+    local user=${auth_user:-${SUDO_USER:-root}} current pa root_login how whitelist
+    current=$(ssh_ports 2>/dev/null) || current=''
     pa=$(sshd_value passwordauthentication) || pa=''
     root_login=$(sshd_value permitrootlogin) || root_login=''
-    section 'SSH 登录方式'
+    printf '\n'
+    if [[ -f $PENDING_FILE ]]; then status_row 'SSH 端口' "${current:-未知}" "$c_warn" '迁移待确认：从新端口登录后选 1 完成'
+    else status_row 'SSH 端口' "${current:-未知}" '' "${session_port:+当前连接 $session_port}"; fi
+    if command -v ufw >/dev/null && [[ -n $current ]]; then
+        whitelist=$(ssh_whitelist "$current")
+        if [[ -n $whitelist ]]; then
+            access_label "$whitelist" 44
+            status_row 登录来源 '● 指定 IP' "$c_ok" "${REPLY#只允许 }"
+        else
+            status_row 登录来源 '所有 IP' '' '要限制来源，到「端口访问管理」修改 SSH 那一行'
+        fi
+    fi
     if [[ $pa == no ]]; then
         status_row 密码登录 '● 已关闭' "$c_ok" '只能用密钥登录'
     else
@@ -1201,7 +1320,7 @@ password_login() {
         # Never close password login unless someone can still get in with a key.
         if [[ -n ${client_addr:-} ]]; then
             session_auth
-            [[ $auth_method == publickey ]] || die "当前窗口不是用密钥登录的（${auth_method:-查不到登录方式}）。请先在菜单 11 里添加公钥，用密钥登录一次，再在那个窗口里关闭密码登录。"
+            [[ $auth_method == publickey ]] || die "当前窗口不是用密钥登录的（${auth_method:-查不到登录方式}）。请先在「SSH 管理 → 管理公钥」里添加公钥，用密钥登录一次，再在那个窗口里关闭密码登录。"
         else
             for user in $(login_users); do
                 (( $(key_count "$user") == 0 )) || with_keys+="${with_keys:+、}$user"
@@ -1241,32 +1360,12 @@ PY
     if [[ $want == off ]]; then printf 'SSH 密码登录已关闭，现在只能用密钥登录。\n'
     else printf 'SSH 密码登录已打开。\n'; fi
 }
-menu_auth() {
-    local pa choice
-    session_auth
-    auth_status "${auth_user:-${SUDO_USER:-root}}"
-    pa=$(sshd_value passwordauthentication) || pa=''
-    printf '\n  1) 修改密码\n  2) 管理公钥\n'
-    if [[ $pa == no ]]; then printf '  3) 打开密码登录\n\n'; else printf '  3) 关闭密码登录（只允许密钥登录）\n\n'; fi
-    while true; do
-        ask choice '请选择 [1-3]（回车返回）: ' && [[ -n $choice ]] || return 0
-        case $choice in
-            1) ask_login_user '修改哪个用户的密码？' || return 0; bash "$SELF" passwd "$REPLY" || true; return 0 ;;
-            2) ask_login_user '管理哪个用户的公钥？' || return 0; bash "$SELF" keys "$REPLY" || true; return 0 ;;
-            3)
-                if [[ $pa == no ]]; then bash "$SELF" password-login on || true
-                else bash "$SELF" password-login off || true; fi
-                return 0 ;;
-            *) printf '请输入 1、2 或 3。\n' ;;
-        esac
-    done
-}
 menu_unban() {
     local ip list
     list=" $(f2b_field 'Banned IP list') "
     while true; do
         printf '\n'
-        ask ip '要解封哪个 IP？（回车跳过）: ' && [[ -n $ip ]] || return 0
+        ask ip '要解封哪个 IP？（回车返回）: ' && [[ -n $ip ]] || return 0
         [[ $list != *" $ip "* ]] || break
         printf '%s 不在封禁名单里。\n' "$ip"
     done
@@ -1274,26 +1373,25 @@ menu_unban() {
     else printf '解封失败，请查看 Fail2ban 状态。\n'; fi
 }
 ports_command() {
-    local op=${1:-list} list=${2:-} proto source new='' p protocol comment covering
+    local op=${1:-list}
     command -v ufw >/dev/null || die '还没有初始化：请先在菜单选 1，或运行 vpsfw install。'
     load_rules
-    if [[ $op == list ]]; then
-        (( $# <= 1 )) || die 'ports list 无需其他参数。'
-        list_ports; return
-    fi
     case "$op" in
-        add|delete)
-            (( $# >= 2 && $# <= 4 )) || die '用法：ports add/delete 端口列表 [协议] [来源]'
-            proto=${3:-tcp}; source=${4:-any} ;;
-        change)
-            (( $# >= 3 && $# <= 5 )) || die '用法：ports change 旧端口 新端口 [协议] [来源]'
-            list=$(clean_ports "$list"); new=$(clean_ports "$3"); proto=${4:-tcp}; source=${5:-any}
-            valid_spec "$list" && valid_spec "$new" || die '替换操作每次接受一个端口或范围。'
-            [[ ${new%%:*} != "${new##*:}" ]] || new=${new%%:*}
-            [[ ${list%%:*} != "${list##*:}" ]] || list=${list%%:*}
-            [[ $list != "$new" ]] || die '新旧端口相同。' ;;
-        *) die 'ports 支持 list、add、delete、change。' ;;
+        list)
+            (( $# <= 1 )) || die 'ports list 无需其他参数。'
+            set_colors; access_load; printf '\n'; access_print
+            [[ -z $(rule_info --other) ]] || printf '\n  %s另有不归本工具管理的规则，用 vpsfw status 查看。%s\n' "$c_dim" "$c_off"
+            printf '\n' ;;
+        add|delete) ports_edit "$@" ;;
+        set|close|change) ports_access "$@" ;;
+        *) die 'ports 支持 list、set、add、delete、change、close。' ;;
     esac
+}
+# add/delete: one source more or less on each of the ports.
+ports_edit() {
+    local op=$1 list=$2 proto source p protocol comment covering lookup_status
+    (( $# >= 2 && $# <= 4 )) || die '用法：ports add/delete 端口列表 [协议] [来源]'
+    proto=${3:-tcp}; source=${4:-any}
     proto=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
     [[ $proto == tcp || $proto == udp || $proto == both ]] || die "协议只能是 tcp、udp 或 both（两者都要），收到：$proto"
     source=$(normalize_source "$source") || die '来源地址无效。'
@@ -1305,53 +1403,29 @@ ports_command() {
         for protocol in "${protocols[@]}"; do
             check_ssh_collision "$p" "$protocol"
             if comment=$(rule_info "$p" "$protocol" "$source"); then
-                [[ $comment != *SSH* && $comment != *ssh* ]] || die "$p/$protocol 是 SSH 入口，请用菜单 8「修改 SSH 端口」管理。"
+                [[ $comment != SSH ]] || die "$p/$protocol 是 SSH 入口，请到「SSH 管理」里改。"
             else
-                local lookup_status=$?
+                lookup_status=$?
                 (( lookup_status == 1 )) || die '无法明确识别现有规则。'
                 [[ $op == add ]] || die "找不到 $p/${protocol}（来源 $(source_label "$source")）的放行规则。用 vpsfw ports list 查看现有规则。"
             fi
-            if [[ $op == change ]]; then
-                check_ssh_collision "$new" "$protocol"
-                if comment=$(rule_info "$new" "$protocol" "$source"); then
-                    [[ $comment != *SSH* && $comment != *ssh* ]] || die "$new/$protocol 是 SSH 入口，不能作为替换目标。"
-                else
-                    local lookup_status=$?
-                    (( lookup_status == 1 )) || die '无法明确识别新端口规则。'
-                fi
-            fi
         done
     done
-    local joined
-    joined=$(IFS=,; printf '%s' "${ports[*]}")
-    case "$op" in
-        add) printf '\n添加放行：%s' "$joined" ;;
-        delete) printf '\n删除放行：%s' "$joined" ;;
-        change) printf '\n替换放行：%s → %s' "$list" "$new" ;;
-    esac
+    if [[ $op == add ]]; then printf '\n添加放行：%s' "$(IFS=,; printf '%s' "${ports[*]}")"
+    else printf '\n删除放行：%s' "$(IFS=,; printf '%s' "${ports[*]}")"; fi
     printf '  %s  来源 %s\n' "$(proto_label "$proto")" "$(source_label "$source")"
     backup_ufw
-    # Complete all additions before any deletions during a replacement.
-    if [[ $op == change ]]; then
-        for protocol in "${protocols[@]}"; do
-            if ! existing_rule "$new" "$protocol" "$source"; then port_rule add "$new" "$protocol" "$source"; fi
-            printf '  ✓ 已放行 %s/%s\n' "$new" "$protocol"
-        done
-    fi
     for p in "${ports[@]}"; do
         for protocol in "${protocols[@]}"; do
-            case "$op" in
-                add)
-                    if existing_rule "$p" "$protocol" "$source"; then
-                        printf '  · %s/%s 已经放行，跳过\n' "$p" "$protocol"
-                    else
-                        port_rule add "$p" "$protocol" "$source"
-                        printf '  ✓ 已放行 %s/%s\n' "$p" "$protocol"
-                    fi ;;
-                delete|change)
-                    port_rule delete "$p" "$protocol" "$source"
-                    printf '  ✓ 已删除 %s/%s\n' "$p" "$protocol" ;;
-            esac
+            if [[ $op == delete ]]; then
+                port_rule delete "$p" "$protocol" "$source"
+                printf '  ✓ 已删除 %s/%s\n' "$p" "$protocol"
+            elif existing_rule "$p" "$protocol" "$source"; then
+                printf '  · %s/%s 已经放行，跳过\n' "$p" "$protocol"
+            else
+                port_rule add "$p" "$protocol" "$source"
+                printf '  ✓ 已放行 %s/%s\n' "$p" "$protocol"
+            fi
         done
     done
     load_rules
@@ -1359,39 +1433,131 @@ ports_command() {
     # Point out rules that still decide access, instead of a generic disclaimer.
     for p in "${ports[@]}"; do
         for protocol in "${protocols[@]}"; do
-            covering=''
             if [[ $op == add && $source != any ]]; then
                 covering=$(covering_rules "$p" "$protocol" any)
-                [[ -z $covering ]] || printf '\n注意：%s/%s 还有对所有来源开放的规则，只限来源 %s 不会生效：\n%s\n如需收紧，请删除上面这条规则。\n' "$p" "$protocol" "$source" "$covering"
-            elif [[ $op != add ]]; then
+                [[ -z $covering ]] || printf '\n注意：%s/%s 还有对所有 IP 开放的规则，只允许 %s 不会生效：\n%s\n' "$p" "$protocol" "$source" "$covering"
+            elif [[ $op == delete ]]; then
                 covering=$(covering_rules "$p" "$protocol")
                 [[ -z $covering ]] || printf '\n注意：%s/%s 仍被下面的规则放行：\n%s\n' "$p" "$protocol" "$covering"
             fi
         done
     done
-    if [[ $op != delete ]]; then
-        local idle='' targets=("${ports[@]}")
-        [[ $op != change ]] || targets=("$new")
-        for p in "${targets[@]}"; do
-            for protocol in "${protocols[@]}"; do
-                [[ -n $(ss -H -ln"${protocol:0:1}" "sport >= :${p%%:*} and sport <= :${p##*:}" 2>/dev/null) ]] ||
-                    idle+="${idle:+、}${p/:/-}/$protocol"
-            done
+    [[ $op == delete ]] || access_hints
+}
+# set: each port lets in exactly the given sources ("any" = all IPs); close: delete every rule of the
+# ports; change: move one port's rules to another port. New rules go in before old ones are deleted,
+# so addresses that stay allowed never lose access in between.
+ports_access() {
+    local op=$1 list=${2:-} proto target='' new='' ssh p protocol sources comment covering ssh_limited=0
+    case "$op" in
+        set)
+            (( $# == 4 )) || die '用法：ports set 端口列表 协议 来源列表|any'
+            proto=$3; target=$(normalize_sources "$4") || die '来源地址无效。' ;;
+        close)
+            (( $# == 2 || $# == 3 )) || die '用法：ports close 端口列表 [协议]'
+            proto=${3:-tcp} ;;
+        change)
+            (( $# == 3 || $# == 4 )) || die '用法：ports change 旧端口 新端口 [协议]'
+            proto=${4:-tcp}; list=$(clean_ports "$list"); new=$(clean_ports "$3")
+            valid_spec "$list" && valid_spec "$new" || die '换端口每次只能换一个端口或范围。'
+            [[ ${new%%:*} != "${new##*:}" ]] || new=${new%%:*}
+            [[ ${list%%:*} != "${list##*:}" ]] || list=${list%%:*}
+            [[ $list != "$new" ]] || die '新旧端口相同。' ;;
+    esac
+    proto=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
+    [[ $proto == tcp || $proto == udp || $proto == both ]] || die "协议只能是 tcp、udp 或 both（两者都要），收到：$proto"
+    parse_ports "$list"
+    local protocols=(tcp udp)
+    [[ $proto == both ]] || protocols=("$proto")
+    ssh=$(ssh_ports) || die '无法读取 SSH 配置，暂不修改规则。'
+    ssh=",$ssh,${session_port:-},"
+    # Validate the entire batch before the first mutation.
+    for p in "${ports[@]}"; do
+        if [[ $ssh == *",$p,"* && $proto != udp ]]; then
+            [[ $op == set ]] || die "$p 是 SSH 端口，不能在这里关闭或换号；换 SSH 端口请到「SSH 管理 → 修改 SSH 端口」。"
+            [[ $proto == tcp ]] || die "SSH 端口 $p 只用 TCP，请把协议写成 tcp。"
+            [[ ! -f $PENDING_FILE ]] || die 'SSH 端口迁移还没完成，请先到「SSH 管理」确认或回退，再限制 SSH 的来源。'
+            check_session_allowed "$p" "$target"
+            [[ $target == any ]] || ssh_limited=1
+            continue
+        fi
+        for protocol in "${protocols[@]}"; do
+            check_ssh_collision "$p" "$protocol"
+            [[ $op == set || -n $(port_sources "$p" "$protocol") ]] || die "${p/:/-}/$protocol 没有放行规则，用 vpsfw ports list 查看。"
+            if [[ $op == change ]]; then
+                check_ssh_collision "$new" "$protocol"
+                [[ -z $(port_sources "$new" "$protocol") ]] ||
+                    die "新端口 ${new/:/-}/$protocol 已经有放行规则，请先关闭它，或者直接修改它允许的 IP。"
+            fi
         done
-        [[ -z $idle ]] || printf '\n目前没有程序在监听 %s，服务启动后外部才能访问。\n' "$idle"
+    done
+    case "$op" in
+        set) access_label "$target" 200; printf '\n%s  %s  →  %s\n' "$(IFS=,; printf '%s' "${ports[*]//:/-}")" "$(proto_label "$proto")" "$REPLY" ;;
+        close) printf '\n关闭：%s  %s\n' "$(IFS=,; printf '%s' "${ports[*]//:/-}")" "$(proto_label "$proto")" ;;
+        change) printf '\n换端口：%s → %s  %s\n' "${list/:/-}" "${new/:/-}" "$(proto_label "$proto")" ;;
+    esac
+    backup_ufw
+    if [[ $op == change ]]; then
+        # Open the new port for every protocol before closing anything on the old one.
+        for protocol in "${protocols[@]}"; do
+            sources=$(port_sources "$list" "$protocol" | paste -sd, -)
+            sync_sources "$new" "$protocol" "$sources"
+        done
+        for protocol in "${protocols[@]}"; do sync_sources "$list" "$protocol" ''; done
     fi
+    for p in "${ports[@]}"; do
+        comment=''
+        [[ $ssh != *",$p,"* || $proto != tcp ]] || comment=SSH
+        for protocol in "${protocols[@]}"; do
+            case "$op" in
+                set) sync_sources "$p" "$protocol" "$target" "$comment" ;;
+                close) sync_sources "$p" "$protocol" '' ;;
+            esac
+        done
+    done
+    load_rules
+    prune_backups
+    for p in "${ports[@]}"; do
+        for protocol in "${protocols[@]}"; do
+            if [[ $op == set && $target != any ]]; then
+                covering=$(covering_rules "$p" "$protocol" any)
+                [[ -z $covering ]] || printf '\n注意：%s/%s 还被下面这条对所有 IP 开放的规则放行，只允许指定 IP 不会生效：\n%s\n' "${p/:/-}" "$protocol" "$covering"
+            elif [[ $op != set ]]; then
+                covering=$(covering_rules "$p" "$protocol")
+                [[ -z $covering ]] || printf '\n注意：%s/%s 仍被下面的规则放行：\n%s\n' "${p/:/-}" "$protocol" "$covering"
+            fi
+        done
+    done
+    if (( ssh_limited )); then
+        printf '\nSSH 现在只允许名单里的 IP 登录。家里宽带的 IP 可能会变，变了就连不上，只能从服务商网页控制台进去改。\n'
+    fi
+    [[ $op == close ]] || { [[ $op != change ]] || ports=("$new"); access_hints; }
+}
+# After opening ports: services not listening yet, the firewall switch and the cloud security group.
+access_hints() {
+    local p protocol idle=''
+    for p in "${ports[@]}"; do
+        for protocol in "${protocols[@]}"; do
+            [[ -n $(ss -H -ln"${protocol:0:1}" "sport >= :${p%%:*} and sport <= :${p##*:}" 2>/dev/null) ]] ||
+                idle+="${idle:+、}${p/:/-}/$protocol"
+        done
+    done
+    [[ -z $idle ]] || printf '\n目前没有程序在监听 %s，服务启动后外部才能访问。\n' "$idle"
     if [[ $(ufw status) != 'Status: active'* ]]; then
-        printf '\n防火墙当前未启用，规则已保存，启用后才生效（菜单 7）。\n'
-    elif [[ $op != delete ]]; then
+        printf '\n防火墙当前未启用，规则已保存，启用防火墙后才生效。\n'
+    else
         printf '\n服务商安全组（云防火墙）也需要放行对应端口，外部才能访问。\n'
     fi
 }
 ufw_switch() {
     command -v ufw >/dev/null || die '还没有初始化：请先在菜单选 1，或运行 vpsfw install。'
     if [[ $1 == enable ]]; then
-        local p current
+        local p current sources
         current=$(ssh_ports)
         [[ -n $current ]] || die '无法识别 SSH 端口，拒绝启用。'
+        load_rules
+        sources=$(port_sources "${session_port:-0}" tcp | paste -sd, -)
+        [[ -z $sources ]] || check_session_allowed "$session_port" "$sources"
         printf '启用防火墙：先确保 SSH 端口 %s 放行，其他未放行的入站连接将被拒绝。\n' "$current"
         confirm '现在启用？' y || cancel
         IFS=, read -r -a current_ports <<< "$current"
@@ -1433,18 +1599,26 @@ menu_rule() {
     printf -v line '%*s' "$menu_span" ''
     printf '  %s%s%s\n' "$purple" "${line// /─}" "$reset"
 }
-menu_draw() {
-    local fw=$1 ban=$2 current=$3 columns=$4
-    local cyan='' purple='' reset='' bold='' dim=''
+menu_colors() {
+    cyan='' purple='' reset='' bold='' dim=''
     if [[ -t 1 && ${TERM:-dumb} != dumb && ${NO_COLOR+x} != x ]]; then
-        cyan=$'\033[36m'; purple=$'\033[34m'; reset=$'\033[0m'
-        bold=$'\033[1m'; dim=$'\033[90m'
+        cyan=$'\033[36m'; purple=$'\033[34m'; reset=$'\033[0m'; bold=$'\033[1m'; dim=$'\033[90m'
     fi
-    local menu_span=60 wide=1 i left right padding
+}
+clear_screen() { if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi; }
+# Terminal width decides between two columns and one (wide), and the length of the rules (menu_span).
+menu_layout() {
+    columns=$(tput cols 2>/dev/null) || columns=${COLUMNS:-80}
+    [[ $columns =~ ^[0-9]+$ ]] || columns=80
+    menu_span=60 wide=1
     if (( columns < 64 )); then
         wide=0; menu_span=$((columns - 4))
         (( menu_span >= 24 )) || menu_span=24
     fi
+}
+MENU_LABELS=('初始化防护' '状态总览' '端口访问管理' 'SSH 管理' 'Fail2ban 管理' '防火墙与 Ping')
+menu_draw() {
+    local fw=$1 ban=$2 current=$3 i padding
     printf '\n'
     if (( columns >= 44 )); then
         printf '%s' "$cyan"
@@ -1468,36 +1642,59 @@ LOGO
     fi
     menu_rule
     printf '\n'
-    local labels=('初始化防护' '状态与规则' '添加放行端口' '删除放行端口' '替换放行端口' '查看端口监听'
-                  '防火墙开关' '修改 SSH 端口' 'Fail2ban 管理' 'SSH 登录记录' 'SSH 登录方式' 'Ping 开关')
     if (( wide )); then
-        menu_pair '端口管理' '防护与 SSH'
-        printf '\n'
-        for ((i=0;i<6;i++)); do
-            left=${labels[i]}
-            menu_item "$((i+1))" "$left"
-            if (( i < 6 )); then
-                menu_width "$left"; padding=$((28 - 4 - REPLY))
-                # The first column already supplied the row indentation.
-                printf '%*s    %s%2s.%s %s' "$padding" '' "$cyan" "$((i+7))" "$reset" "${labels[i+6]}"
-            fi
-            printf '\n\n'
+        for ((i=0;i<3;i++)); do
+            menu_item "$((i+1))" "${MENU_LABELS[i]}"
+            menu_width "${MENU_LABELS[i]}"; padding=$((28 - 4 - REPLY))
+            # The first column already supplied the row indentation.
+            printf '%*s    %s%2s.%s %s\n\n' "$padding" '' "$cyan" "$((i+4))" "$reset" "${MENU_LABELS[i+3]}"
         done
     else
-        printf '  %s端口管理%s\n\n' "$dim" "$reset"
-        for ((i=0;i<12;i++)); do
-            if (( i == 6 )); then printf '\n  %s防护与 SSH%s\n\n' "$dim" "$reset"; fi
-            menu_item "$((i+1))" "${labels[i]}"; printf '\n\n'
-        done
+        for ((i=0;i<6;i++)); do menu_item "$((i+1))" "${MENU_LABELS[i]}"; printf '\n\n'; done
     fi
     menu_rule
     menu_item 0 '退出'; printf '\n'; menu_rule
     if [[ -f $PENDING_FILE ]]; then
-        printf '\n  %sSSH 迁移待确认%s\n  请从新端口登录，再选择 8 确认。\n' "$cyan" "$reset"
+        printf '\n  %sSSH 迁移待确认%s\n  请从新端口登录，再进入 4「SSH 管理」确认。\n' "$cyan" "$reset"
     elif [[ $fw == 未安装 ]]; then
         printf '\n  %s尚未初始化%s\n  新服务器请先选择 1。\n' "$cyan" "$reset"
     fi
     printf '\n'
+}
+# Top of a second-level screen; the caller prints its status below.
+sub_title() {
+    clear_screen; menu_layout
+    printf '\n  %s%s%s\n' "$bold" "$1" "$reset"
+    menu_rule
+}
+# The numbered actions of a second-level screen, then 0 to go back.
+sub_actions() {
+    local i=0 label
+    printf '\n'; menu_rule; printf '\n'
+    for label in "$@"; do i=$((i + 1)); menu_item "$i" "$label"; printf '\n\n'; done
+    menu_rule
+    menu_item 0 '返回主菜单'; printf '\n'; menu_rule
+    printf '\n'
+}
+# Read a choice from 1 to $1 into choice; returns 1 for 0 or end of input.
+menu_choose() {
+    while true; do
+        ask choice "  请选择 [0-$1]: " || return 1
+        case "$choice" in
+            0|q|Q) return 1 ;;
+            '') ;;
+            *)
+                if [[ $choice =~ ^[0-9]+$ ]] && (( 10#$choice >= 1 && 10#$choice <= $1 )); then
+                    choice=$((10#$choice)); return 0
+                fi
+                printf '  没有这个选项，请输入 0 到 %s。\n' "$1" ;;
+        esac
+    done
+}
+pause() { local reply; ask reply $'\n按回车返回……' || true; }
+not_ready() {
+    command -v ufw >/dev/null && return 1
+    printf '\n还没有初始化，请先在主菜单选 1。\n'; pause
 }
 # ── Menu dialogs: validate each answer on the spot; a blank answer goes back to the menu. ──
 ask_ports() {
@@ -1519,108 +1716,198 @@ ask_proto() {
     done
     return 1
 }
-ask_source() {
+# Who may reach a port: REPLY becomes "any" or a comma list of addresses.
+ask_who() {
     local value
-    while ask value '来源：只允许某个 IP 或网段时填写，回车 = 所有来源: '; do
-        if REPLY=$(normalize_source "${value:-any}"); then return 0; fi
+    printf '\n谁能访问：\n  1) 所有 IP\n  2) 只允许指定的 IP\n'
+    while ask value '请选择 [回车 = 1]: '; do
+        case ${value:-1} in
+            1) REPLY=any; return 0 ;;
+            2) ask_ips; return ;;
+            *) printf '请输入 1 或 2。\n' ;;
+        esac
     done
     return 1
 }
-# Number the plain allow rules into menu_rules; SSH entries are left to the SSH menu.
-show_rules() {
-    local rp rproto rsource rcomment ssh p covers n=0
-    menu_rules=()
-    load_rules
-    ssh=$(ssh_ports 2>/dev/null) || ssh=''
-    while IFS=$'\t' read -r rp rproto rsource rcomment; do
-        [[ $rcomment != *SSH* && $rcomment != *ssh* ]] || continue
-        covers=0
-        if [[ $rproto == tcp ]]; then
-            for p in ${ssh//,/ } ${session_port:-}; do
-                (( 10#$p < 10#${rp%%:*} || 10#$p > 10#${rp##*:} )) || covers=1
-            done
-        fi
-        (( ! covers )) || continue
-        menu_rules+=("$rp"$'\t'"$rproto"$'\t'"$rsource")
-        if (( n == 0 )); then
-            printf '\n  %s%s%s%s备注\n' "$(pad 编号 6)" "$(pad 端口 14)" "$(pad 协议 6)" "$(pad 来源 22)"
-        fi
-        n=$((n + 1))
-        printf '  %s%s%s%s%s\n' "$(pad "$n" 6)" "$(pad "$rp" 14)" "$(pad "$(proto_label "$rproto")" 6)" \
-            "$(pad "$(source_label "$rsource")" 22)" "$rcomment"
-    done < <(rule_info --list)
-    if (( n == 0 )); then
-        printf '\n目前没有可管理的端口放行规则（SSH 入口请用菜单 8 管理）。\n'
-        return 1
-    fi
-    printf '\n  SSH 入口不在此列出，请用菜单 8 管理。\n\n'
+# Addresses or networks separated by commas or spaces; REPLY holds them normalised.
+ask_ips() {
+    local value
+    printf '\n填 IP 或网段，例如 203.0.113.8 或 198.51.100.0/24，多个用逗号分隔。\n'
+    [[ -z ${client_addr:-} ]] || printf '你现在连接用的 IP 是 %s。\n' "$client_addr"
+    while ask value 'IP（回车返回）: ' && [[ -n $value ]]; do
+        if ! REPLY=$(normalize_sources "$value"); then continue; fi
+        [[ $REPLY != any ]] && return 0
+        printf '这里填具体的 IP；要所有 IP 都能访问，请用「端口改成所有 IP 可访问」。\n'
+    done
+    return 1
 }
-# Read rule numbers into picked; $2=1 allows several, e.g. "1,3" or "1 3".
-ask_rule_numbers() {
-    local value item seen
+# Read numbers from 1 to $2 into picked (0-based); $3=1 allows several, e.g. "1,3" or "1 3".
+ask_numbers() {
+    local value item seen items
     while ask value "$1" && [[ -n $value ]]; do
-        value=${value//，/ }; value=${value//,/ }
+        value=${value//，/ }
+        read -r -a items <<< "${value//,/ }"
         picked=(); seen=' '
-        for item in $value; do
-            if [[ ! $item =~ ^[0-9]+$ ]] || (( 10#$item < 1 || 10#$item > ${#menu_rules[@]} )); then
-                printf '没有编号 %s，请输入 1 到 %s 之间的编号。\n' "$item" "${#menu_rules[@]}"; picked=(); break
+        for item in ${items[@]+"${items[@]}"}; do
+            if [[ ! $item =~ ^[0-9]+$ ]] || (( 10#$item < 1 || 10#$item > $2 )); then
+                printf '没有编号 %s，请输入 1 到 %s 之间的编号。\n' "$item" "$2"; picked=(); break
             fi
             [[ $seen == *" $((10#$item)) "* ]] || picked+=($((10#$item - 1)))
             seen+="$((10#$item)) "
         done
         (( ${#picked[@]} )) || continue
-        if (( ${2:-0} == 0 && ${#picked[@]} > 1 )); then printf '一次只能选一条。\n'; continue; fi
+        if (( ${3:-0} == 0 && ${#picked[@]} > 1 )); then printf '一次只能选一个。\n'; continue; fi
         return 0
     done
     return 1
 }
-menu_add() {
-    local list proto source
-    printf '\n添加放行端口。多个端口用逗号分隔，范围写 8000-8010。\n\n'
+# Pick entries of the port list; entry sets e_port, e_proto, e_sources, e_ssh and e_name.
+pick_entry() {
+    if (( ${#access_entries[@]} == 0 )); then printf '\n还没有放行任何端口。\n'; return 1; fi
+    printf '\n'
+    ask_numbers "$1" "${#access_entries[@]}" "${2:-0}"
+}
+entry() {
+    IFS=$'\t' read -r e_port e_proto e_sources e_ssh <<< "${access_entries[$1]}"
+    e_name="${e_port/:/-} $(proto_label "$e_proto")"
+    (( ! e_ssh )) || e_name="SSH ${e_name}"
+}
+access_add() {
+    local list proto sources p protocol taken=''
+    printf '\n放行新端口。多个端口用逗号分隔，范围写 8000-8010。\n\n'
     ask_ports '端口（回车返回）: ' || return 0; list=$REPLY
     ask_proto || return 0; proto=$REPLY
-    ask_source || return 0; source=$REPLY
-    printf '\n将放行：%s  %s  来源 %s\n' "$list" "$(proto_label "$proto")" "$(source_label "$source")"
-    confirm '确认添加？' y || { printf '已取消。\n'; return 0; }
-    bash "$SELF" ports add "$list" "$proto" "$source" || true
-}
-menu_delete() {
-    local i key rp rproto rsource list groups=()
-    show_rules || return 0
-    ask_rule_numbers '要删除哪几条？输入编号，多个用逗号分隔（回车返回）: ' 1 || return 0
-    printf '\n将删除：\n'
-    for i in "${picked[@]}"; do
-        IFS=$'\t' read -r rp rproto rsource <<< "${menu_rules[i]}"
-        printf '  %s/%s  来源 %s\n' "$rp" "$rproto" "$(source_label "$rsource")"
-        key="$rproto"$'\t'"$rsource"
-        [[ " ${groups[*]-} " == *" $key "* ]] || groups+=("$key")
-    done
-    confirm '确认删除？' || { printf '已取消。\n'; return 0; }
-    # One call per protocol and source; each call checks its whole batch before changing anything.
-    for key in "${groups[@]}"; do
-        list=''
-        for i in "${picked[@]}"; do
-            IFS=$'\t' read -r rp rproto rsource <<< "${menu_rules[i]}"
-            [[ "$rproto"$'\t'"$rsource" != "$key" ]] || list+=${list:+,}$rp
+    local protocols=(tcp udp)
+    [[ $proto == both ]] || protocols=("$proto")
+    for p in ${list//,/ }; do
+        for protocol in "${protocols[@]}"; do
+            [[ -z $(port_sources "$p" "$protocol") ]] || taken+="${taken:+、}${p/:/-}/$protocol"
         done
-        bash "$SELF" ports delete "$list" "${key%%$'\t'*}" "${key#*$'\t'}" || true
     done
+    if [[ -n $taken ]]; then
+        printf '\n%s 已经放行过了。要改谁能访问，请用「修改某个端口允许的 IP」。\n' "$taken"; return 0
+    fi
+    ask_who || return 0; sources=$REPLY
+    access_label "$sources" 200
+    printf '\n将放行：%s  %s  %s\n' "${list//:/-}" "$(proto_label "$proto")" "$REPLY"
+    confirm '确认放行？' y || { printf '已取消。\n'; return 0; }
+    bash "$SELF" ports set "$list" "$proto" "$sources" || true
 }
-menu_change() {
-    local rp rproto rsource value new
-    show_rules || return 0
-    ask_rule_numbers '要替换哪一条？输入编号（回车返回）: ' 0 || return 0
-    IFS=$'\t' read -r rp rproto rsource <<< "${menu_rules[picked[0]]}"
-    printf '\n原规则：%s/%s  来源 %s\n' "$rp" "$rproto" "$(source_label "$rsource")"
+access_edit() {
+    local choice ips=() keep='' i n
+    pick_entry '修改哪个端口允许的 IP？输入编号（回车返回）: ' || return 0
+    entry "${picked[0]}"
+    [[ ,$e_sources, == *,any,* ]] || IFS=, read -r -a ips <<< "$e_sources"
+    if (( ${#ips[@]} == 0 )); then
+        printf '\n%s 现在所有 IP 都能访问。填上 IP 以后，就只有这些 IP 能访问。\n' "$e_name"
+        choice=1
+    else
+        printf '\n%s 现在只允许：\n\n' "$e_name"
+        for i in "${!ips[@]}"; do printf '  %s%s\n' "$(pad "$((i + 1))" 4)" "${ips[i]}"; done
+        printf '\n  1) 添加 IP\n  2) 移除 IP\n\n'
+        while true; do
+            ask choice '请选择（回车返回）: ' && [[ -n $choice ]] || return 0
+            [[ $choice != 1 && $choice != 2 ]] || break
+            printf '请输入 1 或 2。\n'
+        done
+    fi
+    if [[ $choice == 1 ]]; then
+        ask_ips || return 0
+        keep=$(printf '%s\n' ${ips[@]+"${ips[@]}"} ${REPLY//,/ } | awk 'NF && !seen[$0]++' | paste -sd, -)
+        access_label "$keep" 200
+        printf '\n改完后 %s %s。\n' "$e_name" "$REPLY"
+    else
+        ask_numbers '要移除第几个？多个用逗号分隔（回车返回）: ' "${#ips[@]}" 1 || return 0
+        for i in "${!ips[@]}"; do
+            [[ " ${picked[*]} " == *" $i "* ]] || keep+=${keep:+,}${ips[i]}
+        done
+        if [[ -z $keep ]]; then
+            if (( e_ssh )); then
+                printf '\nSSH 至少要留一个 IP，不然谁都登录不上。想让所有 IP 都能连，请用「端口改成所有 IP 可访问」。\n'; return 0
+            fi
+            printf '\n全部移除后没有 IP 能访问 %s，等于关闭这个端口。\n' "$e_name"
+            confirm '确认关闭？' || { printf '已取消。\n'; return 0; }
+            bash "$SELF" ports close "$e_port" "$e_proto" || true
+            return 0
+        fi
+        access_label "$keep" 200
+        printf '\n改完后 %s %s。\n' "$e_name" "$REPLY"
+    fi
+    if (( e_ssh )); then
+        ( check_session_allowed "$e_port" "$keep" ) || return 0
+        printf '限制以后，从别的网络（换了宽带、用手机热点）就登录不上 SSH 了。\n'
+    fi
+    confirm '确认修改？' y || { printf '已取消。\n'; return 0; }
+    bash "$SELF" ports set "$e_port" "$e_proto" "$keep" || true
+}
+access_open() {
+    pick_entry '哪个端口改成所有 IP 可访问？输入编号（回车返回）: ' || return 0
+    entry "${picked[0]}"
+    if [[ ,$e_sources, == *,any,* ]]; then printf '\n%s 本来就是所有 IP 都能访问。\n' "$e_name"; return 0; fi
+    printf '\n%s 将对所有 IP 开放，原来的名单（%s）用不上了，会一并删除。\n' "$e_name" "${e_sources//,/、}"
+    (( ! e_ssh )) || printf 'SSH 对所有 IP 开放后，靠 Fail2ban 挡暴力破解；建议只用密钥登录。\n'
+    confirm '确认？' y || { printf '已取消。\n'; return 0; }
+    bash "$SELF" ports set "$e_port" "$e_proto" any || true
+}
+access_move() {
+    local value new
+    pick_entry '要换哪个端口？输入编号（回车返回）: ' || return 0
+    entry "${picked[0]}"
+    if (( e_ssh )); then
+        printf '\nSSH 端口请到「SSH 管理 → 修改 SSH 端口」里换，那里会先确认新端口能登录，再关旧端口。\n'; return 0
+    fi
+    access_label "$e_sources" 200
+    printf '\n原端口：%s  %s\n' "$e_name" "$REPLY"
     while true; do
         ask value '新端口或范围（回车返回）: ' && [[ -n $value ]] || return 0
         new=$(clean_ports "$value")
-        valid_spec "$new" && [[ $new != "$rp" ]] && break
+        valid_spec "$new" && [[ $new != "$e_port" ]] && break
         printf '请输入一个与原来不同的端口（1-65535）或范围，例如 8443 或 8000-8010。\n'
     done
-    printf '\n将替换：%s → %s  %s  来源 %s（先放行新端口，再删除旧规则）\n' "$rp" "$new" "$(proto_label "$rproto")" "$(source_label "$rsource")"
-    confirm '确认替换？' y || { printf '已取消。\n'; return 0; }
-    bash "$SELF" ports change "$rp" "$new" "$rproto" "$rsource" || true
+    printf '\n将把 %s 换成 %s，谁能访问保持不变（先放行新端口，再关闭旧端口）。\n' "${e_port/:/-}" "${new/:/-}"
+    confirm '确认？' y || { printf '已取消。\n'; return 0; }
+    bash "$SELF" ports change "$e_port" "$new" "$e_proto" || true
+}
+access_close() {
+    local i targets=()
+    pick_entry '要关闭哪几个？输入编号，多个用逗号分隔（回车返回）: ' 1 || return 0
+    printf '\n'
+    for i in "${picked[@]}"; do
+        entry "$i"
+        if (( e_ssh )); then printf '%s 不能关闭，跳过（换 SSH 端口请到「SSH 管理」）。\n' "$e_name"; continue; fi
+        targets+=("$i")
+        printf '将关闭：%s\n' "$e_name"
+    done
+    (( ${#targets[@]} )) || return 0
+    printf '关闭后外部就访问不了这些端口了。\n'
+    confirm '确认关闭？' || { printf '已取消。\n'; return 0; }
+    for i in "${targets[@]}"; do
+        entry "$i"
+        bash "$SELF" ports close "$e_port" "$e_proto" || true
+    done
+}
+menu_ports() {
+    local choice
+    not_ready && return 0
+    while true; do
+        sub_title '端口访问管理'
+        access_load
+        printf '\n'; access_print 1
+        [[ -z $(rule_info --other) ]] || printf '\n  %s另有不归这里管的规则，在「状态总览」里可以看到。%s\n' "$dim" "$reset"
+        [[ $(ufw status) == 'Status: active'* ]] ||
+            printf '\n  %s防火墙没有启用，现在所有端口都对外开放；这些规则启用后才生效。%s\n' "$c_warn" "$c_off"
+        sub_actions '放行新端口' '修改某个端口允许的 IP' '端口改成所有 IP 可访问' '换成别的端口号' '关闭端口' '查看端口监听'
+        menu_choose 6 || return 0
+        case $choice in
+            1) access_add ;;
+            2) access_edit ;;
+            3) access_open ;;
+            4) access_move ;;
+            5) access_close ;;
+            6) show_listeners || true ;;
+        esac
+        pause
+    done
 }
 # Whether outside traffic can reach a listening port: sets REPLY and state_color.
 firewall_state() {
@@ -1635,7 +1922,7 @@ firewall_state() {
             partial=1
         done
     done <<< "$cover_rules"
-    if (( partial )); then REPLY='● 仅部分来源'; state_color=$c_warn
+    if (( partial )); then REPLY='● 仅指定 IP'; state_color=$c_warn
     else REPLY='● 未放行'; state_color=$c_err; fi
 }
 show_listeners() {
@@ -1677,14 +1964,29 @@ show_listeners() {
     printf '\n'
 }
 menu_firewall() {
-    command -v ufw >/dev/null || { printf '还没有初始化，请先选择 1。\n'; return 0; }
-    if [[ $(ufw status) == 'Status: active'* ]]; then
-        printf '\n防火墙当前：已启用\n'
-        bash "$SELF" firewall disable || true
-    else
-        printf '\n防火墙当前：未启用\n'
-        bash "$SELF" firewall enable || true
-    fi
+    local choice active ping label_fw label_ping
+    not_ready && return 0
+    while true; do
+        sub_title '防火墙与 Ping'
+        printf '\n'; firewall_row; ping_row
+        active=0; [[ $(ufw status) != 'Status: active'* ]] || active=1
+        ping_state; ping=$REPLY
+        if (( active )); then label_fw='停用防火墙'; else label_fw='启用防火墙'; fi
+        if [[ $ping == blocked ]]; then label_ping='允许 ping'; else label_ping='禁止 ping'; fi
+        sub_actions "$label_fw" "$label_ping"
+        menu_choose 2 || return 0
+        printf '\n'
+        case $choice in
+            1) if (( active )); then bash "$SELF" firewall disable || true; else bash "$SELF" firewall enable || true; fi ;;
+            2)
+                case $ping in
+                    blocked) bash "$SELF" ping on || true ;;
+                    unknown) printf 'UFW 的 ping 规则被手动改过，无法自动修改。\n' ;;
+                    *) bash "$SELF" ping off || true ;;
+                esac ;;
+        esac
+        pause
+    done
 }
 menu_ssh_change() {
     local new current choice old_ports new_port
@@ -1711,11 +2013,57 @@ menu_ssh_change() {
     done
     bash "$SELF" ssh change "$new" || true
 }
-menu() {
-    local choice reply source columns
+menu_ssh() {
+    local choice pa label_port label_pa
     while true; do
-        if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then printf '\033[2J\033[H'; fi
-        local fw='未安装' ban='未安装' current='未知' raw
+        sub_title 'SSH 管理'
+        session_auth
+        ssh_status
+        pa=$(sshd_value passwordauthentication) || pa=''
+        if [[ -f $PENDING_FILE ]]; then label_port='完成端口迁移（待确认）'; else label_port='修改 SSH 端口'; fi
+        if [[ $pa == no ]]; then label_pa='打开密码登录'; else label_pa='关闭密码登录（只用密钥）'; fi
+        sub_actions "$label_port" '修改登录密码' '管理公钥' "$label_pa" '登录记录'
+        menu_choose 5 || return 0
+        case $choice in
+            1) menu_ssh_change ;;
+            2) if ask_login_user '修改哪个用户的密码？'; then bash "$SELF" passwd "$REPLY" || true; fi ;;
+            3) if ask_login_user '管理哪个用户的公钥？'; then bash "$SELF" keys "$REPLY" || true; fi ;;
+            4)
+                printf '\n'
+                if [[ $pa == no ]]; then bash "$SELF" password-login on || true
+                else bash "$SELF" password-login off || true; fi ;;
+            5) printf '\n'; menu_logins ;;
+        esac
+        pause
+    done
+}
+menu_f2b() {
+    local choice label_sync
+    while true; do
+        sub_title 'Fail2ban 管理'
+        show_f2b
+        label_sync='按 SSH 端口重新同步'
+        (( ! f2b_sync )) || label_sync+="（需要同步）"
+        sub_actions '解封 IP' "$label_sync"
+        menu_choose 2 || return 0
+        case $choice in
+            1)
+                if [[ -z $f2b_status ]]; then printf '\nFail2ban 没有运行。\n'
+                elif [[ -z $(f2b_field 'Banned IP list') ]]; then printf '\n现在没有被封禁的 IP。\n'
+                else menu_unban; fi ;;
+            2)
+                printf '\n'
+                if confirm '按当前 SSH 端口重新同步 Fail2ban？' y; then bash "$SELF" sync || true; fi ;;
+        esac
+        pause
+    done
+}
+menu() {
+    local choice fw ban current raw columns menu_span wide cyan purple reset bold dim
+    set_colors; menu_colors
+    while true; do
+        clear_screen; menu_layout
+        fw='未安装' ban='未安装'
         if command -v ufw >/dev/null; then
             raw=$(ufw status 2>/dev/null) || raw=''
             case "$raw" in
@@ -1730,39 +2078,16 @@ menu() {
         current=$(ssh_ports 2>/dev/null) || current='未知'
         [[ -n $current ]] || current='未知'
         if (( ${#current} > 18 )); then current="${current:0:15}..."; fi
-        columns=$(tput cols 2>/dev/null) || columns=${COLUMNS:-80}
-        [[ $columns =~ ^[0-9]+$ ]] || columns=80
-        menu_draw "$fw" "$ban" "$current" "$columns"
-        while true; do
-            ask choice '  请选择 [0-12]: ' || return 0
-            case "$choice" in
-                0|q|Q) return 0 ;;
-                [1-9]|1[0-2]) break ;;
-                '') ;;
-                *) printf '  没有这个选项，请输入 0 到 12。\n' ;;
-            esac
-        done
-        case "$choice" in
-            1) bash "$SELF" install || true ;;
-            2) bash "$SELF" status || true ;;
-            3) menu_add ;;
-            4) menu_delete ;;
-            5) menu_change ;;
-            6) show_listeners || true ;;
-            7) menu_firewall ;;
-            8) menu_ssh_change ;;
-            9)
-                show_f2b
-                [[ -z $f2b_status || -z $(f2b_field 'Banned IP list') ]] || menu_unban
-                if (( f2b_sync )); then
-                    printf '\n'
-                    if confirm '按当前 SSH 端口重新同步 Fail2ban？' y; then bash "$SELF" sync || true; fi
-                fi ;;
-            10) menu_logins ;;
-            11) menu_auth ;;
-            12) menu_ping ;;
+        menu_draw "$fw" "$ban" "$current"
+        menu_choose 6 || return 0
+        case $choice in
+            1) bash "$SELF" install || true; pause ;;
+            2) bash "$SELF" status || true; pause ;;
+            3) menu_ports ;;
+            4) menu_ssh ;;
+            5) menu_f2b ;;
+            6) menu_firewall ;;
         esac
-        ask reply $'\n按回车返回菜单……' || return 0
     done
 }
 
@@ -1787,7 +2112,7 @@ while (( $# )); do
         *) die "未知参数：$1（使用 --help 查看帮助）" ;;
     esac
 done
-trap 'printf "\n操作中断：上面这一步执行失败（脚本第 %s 行），部分配置可能已经修改。\n请保留当前 SSH 连接，用菜单 2 查看状态后再重试。\n" "$LINENO" >&2' ERR
+trap 'printf "\n操作中断：上面这一步执行失败（脚本第 %s 行），部分配置可能已经修改。\n请保留当前 SSH 连接，用主菜单 2 查看状态后再重试。\n" "$LINENO" >&2' ERR
 [[ $EUID -eq 0 ]] || die '需要 root 权限，请用 sudo vpsfw 运行。'
 if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login|ping)$ ]]; then
     [[ -t 0 ]] || die '请下载脚本后在交互终端运行，不要通过管道运行。'
@@ -1882,6 +2207,12 @@ if command -v ufw >/dev/null && [[ $(ufw status 2>/dev/null) == 'Status: active'
     printf '\n这台服务器已经初始化过：防火墙已启用，Fail2ban 正在保护 SSH，通常不需要再做。\n'
     printf '重新初始化会重装软件包、覆盖 Fail2ban 的 SSH 设置（会先备份）并重设防火墙默认规则；已有的放行规则保留。\n'
 fi
+# A whitelisted SSH port stays whitelisted; make sure it still lets this session in before enabling.
+if command -v ufw >/dev/null; then
+    load_rules
+    sources=$(port_sources "$ssh_port" tcp | paste -sd, -)
+    [[ -z $sources ]] || check_session_allowed "$ssh_port" "$sources"
+fi
 printf '\n初始化将会：\n'
 printf '  · 安装 UFW 和 Fail2ban\n'
 if ! command -v apt-get >/dev/null; then
@@ -1890,7 +2221,7 @@ fi
 printf '  · 放行 SSH 端口 %s/TCP，拒绝其他未放行的入站连接（IPv4 和 IPv6），出站不限\n' "$ssh_port"
 printf '  · SSH 登录 5 分钟内失败 5 次（包括拿真实用户名反复试密钥），封禁该 IP 10 分钟\n'
 printf '  · 保留已有的 UFW 规则；备份后覆盖 /etc/fail2ban/jail.d/sshd.local\n'
-printf '\n不修改 SSH 端口；其他端口初始化后用菜单 3 添加。\n'
+printf '\n不修改 SSH 端口；其他端口初始化后在主菜单 3「端口访问管理」里放行。\n'
 printf '不适合 Docker 端口映射、NAT 转发、VPN 网关或已有复杂防火墙的服务器。\n'
 printf '建议先打开服务商网页控制台备用，万一连不上可以从那里恢复。\n\n'
 if (( reinit )); then confirm '仍要重新初始化？' || cancel '没有修改任何配置'
@@ -2003,6 +2334,6 @@ prune_backups
 printf '\n初始化完成：防火墙已启用，Fail2ban 正在保护 SSH 端口 %s。\n\n' "$all_ssh_ports"
 printf '接下来：\n'
 printf '  1. 不要关闭当前窗口，新开一个终端确认还能登录：%s\n' "$(ssh_login_hint "$ssh_port")"
-printf '  2. 网站、数据库等其他端口，用菜单 3 添加放行（服务商安全组也要放行）\n\n'
+printf '  2. 网站、数据库等其他端口，在主菜单 3「端口访问管理」里放行（服务商安全组也要放行）\n\n'
 printf '万一连不上：在当前窗口或服务商控制台执行 ufw disable 关闭防火墙；\n'
 printf '如果是自己的 IP 被误封：fail2ban-client set sshd unbanip 你的公网IP\n'
