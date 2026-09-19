@@ -43,12 +43,14 @@ VPS Firewall — Linux 服务器安全与端口管理
   vpsfw ssh finish                   # 新端口登录后关闭旧入口
   vpsfw ssh rollback
   vpsfw sync                         # 同步 Fail2ban SSH 端口
+  vpsfw fail2ban-mode aggressive     # 识别模式：normal、extra 或 aggressive
   vpsfw logins 7                     # 最近 7 天的 SSH 登录记录
   vpsfw passwd [用户]                # 修改登录密码
   vpsfw keys [用户]                  # 查看、添加、删除 SSH 公钥
   vpsfw password-login off|on        # 关闭或打开 SSH 密码登录
   vpsfw ping off|on                  # 禁止或恢复别人 ping 这台服务器
   vpsfw firewall enable|disable
+  vpsfw docker on|off                # 接管或取消接管 Docker 映射的端口
   vpsfw help                         # 显示本帮助
 
 ports set 端口列表 协议 来源列表|any：来源用逗号分隔，any 表示所有 IP。
@@ -332,6 +334,164 @@ sync_sources() {
         printf '  ✓ %s/%s  移除 %s\n' "${spec/:/-}" "$protocol" "$(source_label "$source")"
     done
 }
+# ── Docker: published ports are DNATed straight to containers through FORWARD, so UFW's input rules
+# never see them. Once taken over, the port rules are mirrored into DOCKER-USER (Docker's hook for
+# user filters) through a block in after.rules / after6.rules, matched on the original host port. ──
+DOCKER_BEGIN='# BEGIN VPSFW DOCKER'
+docker_managed() { grep -qxF "$DOCKER_BEGIN" /etc/ufw/after.rules 2>/dev/null; }
+# Docker only filters through DOCKER-USER when it runs in its default iptables mode.
+docker_hooked() { iptables -S FORWARD 2>/dev/null | grep -q -- '-j DOCKER-USER'; }
+# Published ports reachable from outside: port<TAB>proto<TAB>containers, one line each.
+docker_ports() {
+    command -v docker >/dev/null || return 0
+    { timeout 10 docker ps --format $'{{.Names}}\t{{.Ports}}' 2>/dev/null || true; } | python3 -c '
+import ipaddress, re, sys
+found = {}
+for line in sys.stdin:
+    name, _, ports = line.rstrip("\n").partition("\t")
+    for item in ports.split(","):
+        m = re.fullmatch(r"(.*):(\d+)(?:-(\d+))?->\d+(?:-\d+)?/(tcp|udp)", item.strip())
+        if not m: continue
+        host = m.group(1).strip("[]")
+        try:
+            if host and ipaddress.ip_address(host).is_loopback: continue
+        except ValueError: pass
+        spec = m.group(2) + (":" + m.group(3) if m.group(3) and m.group(3) != m.group(2) else "")
+        names = found.setdefault((spec, m.group(4)), [])
+        if name not in names: names.append(name)
+for (spec, proto), names in sorted(found.items(), key=lambda x: (int(x[0][0].split(":")[0]), x[0][1])):
+    print(spec, proto, ",".join(names), sep="\t")
+'
+}
+# owner becomes the containers publishing port $2 of protocol $1, looked up in docker_map.
+docker_owner() {
+    local spec proto names
+    while IFS=$'\t' read -r spec proto names; do
+        [[ -n $spec && $proto == "$1" ]] || continue
+        if (( 10#$2 >= 10#${spec%%:*} && 10#$2 <= 10#${spec##*:} )); then owner=$names; return 0; fi
+    done <<< "${docker_map:-}"
+    return 1
+}
+# The after.rules block for IPv4 ($1 = 4) or IPv6 ($1 = 6). Only connections Docker forwarded from a
+# published port into a container are checked; container traffic among themselves or out is left alone.
+docker_block() {
+    local family=$1 rp rproto rsource item protocol src
+    printf '%s\n*filter\n:DOCKER-USER - [0:0]\n:vpsfw-docker - [0:0]\n' "$DOCKER_BEGIN"
+    printf -- '-A DOCKER-USER -i docker0 -j RETURN\n-A DOCKER-USER -i br-+ -j RETURN\n'
+    printf -- '-A DOCKER-USER -o docker0 -m conntrack --ctstate DNAT --ctdir ORIGINAL -j vpsfw-docker\n'
+    printf -- '-A DOCKER-USER -o br-+ -m conntrack --ctstate DNAT --ctdir ORIGINAL -j vpsfw-docker\n'
+    printf -- '-A vpsfw-docker -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n'
+    while IFS=$'\t' read -r rp rproto rsource; do
+        [[ -n $rp ]] || continue
+        src=''
+        if [[ $rsource == *:* ]]; then [[ $family == 6 ]] || continue; src="-s $rsource "
+        elif [[ $rsource != any ]]; then [[ $family == 4 ]] || continue; src="-s $rsource "; fi
+        for item in ${rp//,/ }; do
+            for protocol in tcp udp; do
+                [[ $rproto == any || $rproto == "$protocol" ]] || continue
+                printf -- '-A vpsfw-docker -p %s %s-m conntrack --ctorigdstport %s -j RETURN\n' "$protocol" "$src" "$item"
+            done
+        done
+    done < <(rule_info --cover)
+    printf -- '-A vpsfw-docker -j DROP\nCOMMIT\n# END VPSFW DOCKER\n'
+}
+# docker_write 文件 set 内容 | docker_write 文件 remove: returns 3 when the file already matches.
+docker_write() {
+    python3 - "$@" <<'PY'
+import os, re, sys
+path, mode = sys.argv[1:3]
+text = open(path).read()
+new = re.sub(r'\n*^# BEGIN VPSFW DOCKER\n.*?^# END VPSFW DOCKER\n?', '', text, flags=re.M | re.S)
+if mode == 'set': new = new.rstrip('\n') + '\n\n' + sys.argv[3].rstrip('\n') + '\n'
+elif not new.endswith('\n'): new += '\n'
+if new == text: sys.exit(3)
+tmp = path + '.vpsfw-tmp'
+with open(tmp, 'w') as f: f.write(new)
+os.chmod(tmp, os.stat(path).st_mode & 0o777); os.replace(tmp, path)
+PY
+}
+# Rewrite the Docker blocks from the current port rules; reload the firewall when they changed.
+docker_sync() {
+    docker_managed || return 0
+    local changed=0 family file
+    load_rules
+    for family in 4 6; do
+        file=/etc/ufw/after.rules; [[ $family == 4 ]] || file=/etc/ufw/after6.rules
+        if docker_write "$file" set "$(docker_block "$family")"; then changed=1
+        elif (( $? != 3 )); then return 1; fi
+    done
+    (( changed )) || return 0
+    [[ $(ufw status) != 'Status: active'* ]] || ufw reload >/dev/null
+}
+# Take the Docker filter out of the running firewall; `ufw disable` leaves DOCKER-USER alone.
+docker_flush() {
+    local cmd rule
+    for cmd in iptables ip6tables; do
+        while read -r rule; do
+            [[ -z $rule ]] || $cmd ${rule/#-A/-D} 2>/dev/null || true
+        done < <($cmd -S DOCKER-USER 2>/dev/null | grep -e '-j vpsfw-docker' -e '-i docker0 -j RETURN' -e '-i br-+ -j RETURN')
+        $cmd -F vpsfw-docker 2>/dev/null || true
+        $cmd -X vpsfw-docker 2>/dev/null || true
+    done
+}
+docker_switch() {
+    local want=$1 docker_map spec proto names fw_active=1 cover_rules state_color missing=() item open=0 file
+    set_colors
+    command -v ufw >/dev/null || die '还没有初始化：请先在菜单选 1，或运行 vpsfw install。'
+    if [[ $want == off ]]; then
+        docker_managed || { printf 'Docker 端口本来就没有接管。\n'; return 0; }
+        printf '取消接管后，Docker 映射的端口不再受防火墙控制，所有 IP 都能访问；端口访问管理里的名单保留不变。\n'
+        confirm '确认取消接管？' || cancel
+        backup_ufw
+        for file in /etc/ufw/after.rules /etc/ufw/after6.rules; do docker_write "$file" remove || (( $? == 3 )); done
+        docker_flush
+        prune_backups
+        printf '已取消接管 Docker 端口。\n'
+        return 0
+    fi
+    docker_managed && { printf 'Docker 端口已经接管了。\n'; return 0; }
+    command -v docker >/dev/null || die '没有检测到 Docker。'
+    docker_hooked || die 'Docker 没有运行，或者没有用默认的 iptables 模式（例如开了 nftables 模式），暂时接管不了。'
+    load_rules
+    cover_rules=$(rule_info --cover)
+    docker_map=$(docker_ports)
+    printf '接管后，Docker 映射的端口和普通端口一样，按「端口访问管理」里的名单放行；没放行的端口外面访问不到。\n'
+    printf '以后新映射的端口，也要先在「端口访问管理」里放行。\n\n'
+    if [[ -n $docker_map ]]; then
+        printf 'Docker 现在映射的端口：\n'
+        while IFS=$'\t' read -r spec proto names; do
+            firewall_state "$proto" "${spec%%:*}" '*'
+            case $REPLY in
+                *已放行) item='所有 IP 都能访问（已有放行规则）' ;;
+                *仅指定*) item='只允许名单里的 IP（已有放行规则）' ;;
+                *) item='没有放行规则'; missing+=("$spec"$'\t'"$proto") ;;
+            esac
+            printf '  %s%s%s\n' "$(pad "${spec/:/-}/$proto" 14)" "$(pad "$names" 20)" "$item"
+        done <<< "$docker_map"
+        printf '\n'
+    fi
+    if (( ${#missing[@]} )); then
+        printf '没有放行规则的端口，接管后外面就访问不到了。\n'
+        if confirm '先把它们对所有 IP 放行，保持现在能访问？' y; then open=1; fi
+    fi
+    confirm '确认接管 Docker 端口？' y || cancel
+    backup_ufw
+    if (( open )); then
+        for item in "${missing[@]}"; do port_rule add "${item%%$'\t'*}" "${item#*$'\t'}" any; done
+    fi
+    # docker_sync only works on a block that exists; start from an empty one.
+    printf '\n%s\n# END VPSFW DOCKER\n' "$DOCKER_BEGIN" >> /etc/ufw/after.rules
+    if ! docker_sync || { [[ $(ufw status) == 'Status: active'* ]] && ! iptables -S vpsfw-docker 2>/dev/null | grep -q -- '-j DROP'; }; then
+        for file in /etc/ufw/after.rules /etc/ufw/after6.rules; do docker_write "$file" remove || true; done
+        docker_flush
+        ufw reload >/dev/null 2>&1 || true
+        die '接管没有成功，已恢复原来的设置。'
+    fi
+    prune_backups
+    (( ! open )) || printf '已对所有 IP 放行：%s\n' "$(printf '%s\n' "${missing[@]}" | tr '\t' / | tr ':' - | paste -sd, - | sed 's/,/、/g')"
+    printf 'Docker 端口已接管，现在按「端口访问管理」里的名单放行。\n'
+    [[ $(ufw status) == 'Status: active'* ]] || printf '防火墙当前未启用，启用后才生效。\n'
+}
 backup_ufw() {
     backup_dir=$(mktemp -d /var/backups/vps-security.XXXXXXXX)
     cp -a /etc/ufw "$backup_dir/ufw"
@@ -421,16 +581,28 @@ wait_f2b() {
     journalctl -u fail2ban -n 30 --no-pager >&2 || true
     return 1
 }
-# aggressive also counts attempts that end before authentication, such as trying keys against a real
-# account after password login is off; normal mode never bans those. Plain TCP probes barely count.
-F2B_FILTER='sshd[mode=aggressive]'
+F2B_JAIL=/etc/fail2ban/jail.d/sshd.local
+# How the sshd filter decides what counts as a failure. aggressive (the default) also counts attempts
+# that end before authentication, such as trying keys against a real account after password login is
+# off; normal mode never bans those. Plain TCP probes barely count in any of them.
+F2B_MODES=(normal extra aggressive)
+F2B_MODE_NOTES=('只统计密码错误、用户不存在这类常规失败'
+                '在 normal 基础上，再统计一些少见的认证失败'
+                '再加上拿真实用户名反复试密钥；关闭密码登录后也能封（推荐）')
+# The mode in the jail file, aggressive when there is none yet.
+f2b_mode() {
+    local mode
+    mode=$(sed -n 's/^filter = sshd\[mode=\([a-z]*\)\]$/\1/p' "$F2B_JAIL" 2>/dev/null | tail -n 1) || mode=''
+    printf '%s\n' "${mode:-aggressive}"
+}
+# write_f2b 端口列表 [模式]: rewrite the jail; the mode stays as it is unless one is given.
 write_f2b() {
-    local target_ports=$1
+    local target_ports=$1 mode=${2:-$(f2b_mode)}
     mkdir -p /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/sshd.local <<EOF || return 1
+    cat > "$F2B_JAIL" <<EOF || return 1
 [sshd]
 enabled = true
-filter = $F2B_FILTER
+filter = sshd[mode=$mode]
 port = $target_ports
 backend = systemd
 maxretry = 5
@@ -442,6 +614,19 @@ ignoreip = 127.0.0.1/8 ::1
 EOF
     local out
     out=$(fail2ban-client -t 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
+}
+f2b_set_mode() {
+    local mode=$1 saved
+    need_tools
+    [[ " ${F2B_MODES[*]} " == *" $mode "* ]] || die '识别模式只能是 normal、extra 或 aggressive。'
+    if [[ $(f2b_mode) == "$mode" ]]; then printf 'Fail2ban 本来就是 %s 模式。\n' "$mode"; return 0; fi
+    saved=$(cat "$F2B_JAIL" 2>/dev/null; printf x)
+    if ! write_f2b "$(ssh_ports)" "$mode" || ! systemctl restart fail2ban || ! wait_f2b; then
+        if [[ $saved == x ]]; then rm -f "$F2B_JAIL"; else printf '%s' "${saved%x}" > "$F2B_JAIL"; fi
+        systemctl restart fail2ban || true
+        die '切换没有成功，已恢复原来的设置。'
+    fi
+    printf 'Fail2ban 已改用 %s 模式。\n' "$mode"
 }
 # Restrict automated rewrites to the includes distributions ship. Snapshot exactly the files edited.
 ssh_config_files() {
@@ -785,6 +970,11 @@ ping_row() {
         *) status_row Ping '未知' "$c_warn" 'UFW 的 ping 规则被手动改过' ;;
     esac
 }
+docker_row() {
+    command -v docker >/dev/null && command -v ufw >/dev/null || return 0
+    if docker_managed; then status_row Docker '● 已接管' "$c_ok" '映射的端口按端口访问管理的名单放行'
+    else status_row Docker '● 未接管' "$c_err" '映射的端口不受防火墙控制，可在「端口访问管理」里接管'; fi
+}
 # Group the allow rules per port into access_entries: port<TAB>proto<TAB>sources<TAB>is-SSH.
 access_load() {
     local ssh line
@@ -794,10 +984,11 @@ access_load() {
     while IFS= read -r line; do
         [[ -z $line ]] || access_entries+=("$line")
     done < <(rule_info --access "$ssh${session_port:+,$session_port}")
+    docker_map=$(docker_ports)
 }
 # Who can reach each port; numbered when $1 is 1.
 access_print() {
-    local numbered=${1:-0} line rp rproto rsources rssh name who n=0
+    local numbered=${1:-0} line rp rproto rsources rssh name who owner n=0
     if (( ${#access_entries[@]} == 0 )); then printf '  %s还没有放行任何端口%s\n' "$c_dim" "$c_off"; return 0; fi
     printf '  %s' "$c_dim"
     (( ! numbered )) || pad 编号 6
@@ -805,7 +996,8 @@ access_print() {
     for line in "${access_entries[@]}"; do
         IFS=$'\t' read -r rp rproto rsources rssh <<< "$line"
         n=$((n + 1)); name=${rp/:/-}
-        (( ! rssh )) || name+=' (SSH)'
+        if (( rssh )); then name+=' (SSH)'
+        elif [[ $rp != *:* ]] && docker_owner "${rproto/both/tcp}" "$rp"; then name+=' (Docker)'; fi
         access_label "$rsources" 44; who=$REPLY
         printf '  '
         (( ! numbered )) || pad "$n" 6
@@ -831,6 +1023,7 @@ show_status() {
     status_row SSH "${ssh:-未知}" "$ssh_color" "$ssh_note"
     status_row Fail2ban "$f2b_state" "$f2b_color" "$f2b_note"
     ping_row
+    docker_row
 
     if command -v ufw >/dev/null; then
         access_load
@@ -877,6 +1070,10 @@ show_f2b() {
         f2b_sync=1
     fi
     status_row 封禁条件 "失败 $maxretry 次" '' "$(human_seconds "$findtime")内失败 $maxretry 次，封禁 $(human_seconds "$bantime")"
+    local mode i note=''
+    mode=$(f2b_mode)
+    for i in "${!F2B_MODES[@]}"; do [[ ${F2B_MODES[i]} != "$mode" ]] || note=${F2B_MODE_NOTES[i]}; done
+    status_row 识别模式 "$mode" '' "$note"
     status_row 封禁中 "$(f2b_field 'Currently banned') 个 IP" '' "累计封禁 $(f2b_field 'Total banned') 次"
     status_row 近期失败 "$(f2b_field 'Currently failed') 次" '' "统计窗口内还没达到封禁条件的失败登录"
     section '正在封禁的 IP'
@@ -1429,6 +1626,7 @@ ports_edit() {
         done
     done
     load_rules
+    docker_sync || printf '注意：Docker 端口的规则没有同步成功，请用 ufw reload 查看原因。\n' >&2
     prune_backups
     # Point out rules that still decide access, instead of a generic disclaimer.
     for p in "${ports[@]}"; do
@@ -1516,6 +1714,7 @@ ports_access() {
         done
     done
     load_rules
+    docker_sync || printf '注意：Docker 端口的规则没有同步成功，请用 ufw reload 查看原因。\n' >&2
     prune_backups
     for p in "${ports[@]}"; do
         for protocol in "${protocols[@]}"; do
@@ -1568,6 +1767,7 @@ ufw_switch() {
         printf '停用防火墙后，服务器上所有监听中的端口都会对外开放（Fail2ban 仍然工作）。\n'
         confirm '确认停用？' || cancel
         ufw disable
+        docker_flush
     fi
 }
 # Count terminal cells rather than characters: CJK characters take two cells,
@@ -1886,8 +2086,24 @@ access_close() {
         bash "$SELF" ports close "$e_port" "$e_proto" || true
     done
 }
+# Under the port list: Docker ports that bypass the firewall, or taken-over ones nobody may reach yet.
+docker_notes() {
+    local spec proto names list='' fw_active=1 cover_rules state_color
+    [[ -n ${docker_map:-} ]] || return 0
+    if ! docker_managed; then
+        while IFS=$'\t' read -r spec proto names; do list+="${list:+、}${spec/:/-}/$proto"; done <<< "$docker_map"
+        printf '\n  %sDocker 映射的端口（%s）不受防火墙控制，所有 IP 都能访问；选 7 接管。%s\n' "$c_err" "$list" "$c_off"
+        return 0
+    fi
+    cover_rules=$(rule_info --cover)
+    while IFS=$'\t' read -r spec proto names; do
+        firewall_state "$proto" "${spec%%:*}" '*'
+        [[ $REPLY != *未放行 ]] || list+="${list:+、}${spec/:/-}/$proto（$names）"
+    done <<< "$docker_map"
+    [[ -z $list ]] || printf '\n  %sDocker 映射的 %s还没放行，外面访问不到。%s\n' "$c_warn" "$list" "$c_off"
+}
 menu_ports() {
-    local choice
+    local choice actions
     not_ready && return 0
     while true; do
         sub_title '端口访问管理'
@@ -1896,8 +2112,13 @@ menu_ports() {
         [[ -z $(rule_info --other) ]] || printf '\n  %s另有不归这里管的规则，在「状态总览」里可以看到。%s\n' "$dim" "$reset"
         [[ $(ufw status) == 'Status: active'* ]] ||
             printf '\n  %s防火墙没有启用，现在所有端口都对外开放；这些规则启用后才生效。%s\n' "$c_warn" "$c_off"
-        sub_actions '放行新端口' '修改某个端口允许的 IP' '端口改成所有 IP 可访问' '换成别的端口号' '关闭端口' '查看端口监听'
-        menu_choose 6 || return 0
+        docker_notes
+        actions=('放行新端口' '修改某个端口允许的 IP' '端口改成所有 IP 可访问' '换成别的端口号' '关闭端口' '查看端口监听')
+        if command -v docker >/dev/null; then
+            if docker_managed; then actions+=('取消接管 Docker 端口'); else actions+=('接管 Docker 端口'); fi
+        fi
+        sub_actions "${actions[@]}"
+        menu_choose "${#actions[@]}" || return 0
         case $choice in
             1) access_add ;;
             2) access_edit ;;
@@ -1905,6 +2126,7 @@ menu_ports() {
             4) access_move ;;
             5) access_close ;;
             6) show_listeners || true ;;
+            7) printf '\n'; if docker_managed; then bash "$SELF" docker off || true; else bash "$SELF" docker on || true; fi ;;
         esac
         pause
     done
@@ -1914,6 +2136,7 @@ firewall_state() {
     local proto=$1 port=$2 addr=$3 rp rproto rsource item partial=0
     case $addr in 127.*|'[::1]'|::1) REPLY='仅本机访问'; state_color=$c_dim; return 0 ;; esac
     if (( ! fw_active )); then REPLY='防火墙未启用'; state_color=$c_warn; return 0; fi
+    if (( ${docker_open:-0} )) && docker_owner "$proto" "$port"; then REPLY='● 不受防火墙控制'; state_color=$c_err; return 0; fi
     while IFS=$'\t' read -r rp rproto rsource; do
         [[ -n $rp && ( $rproto == "$proto" || $rproto == any ) ]] || continue
         for item in ${rp//,/ }; do
@@ -1928,20 +2151,30 @@ firewall_state() {
 show_listeners() {
     set_colors
     local fw_active=0 cover_rules='' listeners proto port addr prog state_color idle='' rp rproto rsource item label found
+    local docker_map docker_open=0 owner spec names
     if command -v ufw >/dev/null; then
         [[ $(ufw status 2>/dev/null) != 'Status: active'* ]] || fw_active=1
         load_rules
         cover_rules=$(rule_info --cover) || cover_rules=''
     fi
+    docker_map=$(docker_ports)
+    [[ -z $docker_map ]] || docker_managed || docker_open=1
     listeners=$(ss -H -lntup | awk '{
         port=$5; sub(/.*:/, "", port); addr=$5; sub(/:[^:]*$/, "", addr)
         prog="-"; if (match($0, /users:\(\("[^"]+"/)) prog=substr($0, RSTART+9, RLENGTH-10)
         if (!seen[$1 " " port " " prog]++) printf "%s\t%s\t%s\t%s\n", $1, port, addr, prog
-    }' | sort -t$'\t' -k2,2n -k1,1) || listeners=''
+    }') || listeners=''
+    # Without Docker's userland proxy a published port has no listener of its own.
+    while IFS=$'\t' read -r spec proto names; do
+        [[ -n $spec ]] || continue
+        grep -q "^$proto"$'\t'"${spec%%:*}"$'\t' <<< "$listeners" || listeners+=$'\n'"$proto"$'\t'"${spec%%:*}"$'\t*\tdocker-proxy'
+    done <<< "$docker_map"
+    listeners=$(sed '/^$/d' <<< "$listeners" | sort -t$'\t' -k2,2n -k1,1)
     printf '\n  %s%s%s%s%s防火墙%s\n' "$c_dim" "$(pad 协议 6)" "$(pad 端口 8)" "$(pad 监听地址 24)" "$(pad 程序 18)" "$c_off"
     while IFS=$'\t' read -r proto port addr prog; do
         [[ -n $port ]] || continue
         firewall_state "$proto" "$port" "$addr"
+        if [[ $prog == docker-proxy ]] && docker_owner "$proto" "$port"; then prog="Docker·$owner"; fi
         printf '  %s%s%s%s%s%s%s\n' "$(pad "$proto" 6)" "$(pad "$port" 8)" "$(pad "$addr" 24)" "$(pad "$prog" 18)" \
             "$state_color" "$REPLY" "$c_off"
     done <<< "$listeners"
@@ -1961,6 +2194,7 @@ show_listeners() {
         done
     done <<< "$cover_rules"
     [[ -z $idle ]] || printf '\n  %s已放行但目前没有程序监听：%s%s\n' "$c_dim" "$idle" "$c_off"
+    (( ! docker_open )) || printf '\n  %sDocker 映射的端口绕过了防火墙，所有 IP 都能访问；可在「端口访问管理」里接管。%s\n' "$c_err" "$c_off"
     printf '\n'
 }
 menu_firewall() {
@@ -2044,8 +2278,8 @@ menu_f2b() {
         show_f2b
         label_sync='按 SSH 端口重新同步'
         (( ! f2b_sync )) || label_sync+="（需要同步）"
-        sub_actions '解封 IP' "$label_sync"
-        menu_choose 2 || return 0
+        sub_actions '解封 IP' "$label_sync" '切换识别模式'
+        menu_choose 3 || return 0
         case $choice in
             1)
                 if [[ -z $f2b_status ]]; then printf '\nFail2ban 没有运行。\n'
@@ -2054,9 +2288,28 @@ menu_f2b() {
             2)
                 printf '\n'
                 if confirm '按当前 SSH 端口重新同步 Fail2ban？' y; then bash "$SELF" sync || true; fi ;;
+            3) menu_f2b_mode ;;
         esac
         pause
     done
+}
+menu_f2b_mode() {
+    local current value i
+    current=$(f2b_mode)
+    printf '\n识别模式决定哪些 SSH 登录尝试算作失败；换模式不影响封禁条件和已封禁的 IP。\n\n'
+    for i in "${!F2B_MODES[@]}"; do
+        printf '  %s) %s%s' "$((i + 1))" "$(pad "${F2B_MODES[i]}" 12)" "${F2B_MODE_NOTES[i]}"
+        [[ ${F2B_MODES[i]} != "$current" ]] || printf '  %s● 当前%s' "$c_ok" "$c_off"
+        printf '\n'
+    done
+    printf '\n'
+    while true; do
+        ask value '请选择（回车返回）: ' && [[ -n $value ]] || return 0
+        [[ ! $value =~ ^[1-3]$ ]] || break
+        printf '请输入 1、2 或 3。\n'
+    done
+    printf '\n'
+    bash "$SELF" fail2ban-mode "${F2B_MODES[value - 1]}" || true
 }
 menu() {
     local choice fw ban current raw columns menu_span wide cyan purple reset bold dim
@@ -2100,7 +2353,7 @@ if (( $# == 0 )); then mode=menu; fi
 case "${1:-}" in
     install) shift ;;
     help) usage; exit 0 ;;
-    status|ssh|ports|firewall|sync|logins|passwd|keys|password-login|ping)
+    status|ssh|ports|firewall|sync|logins|passwd|keys|password-login|ping|fail2ban-mode|docker)
         mode=$1; shift; dispatch_args=("$@"); set -- ;;
 esac
 while (( $# )); do
@@ -2114,7 +2367,7 @@ while (( $# )); do
 done
 trap 'printf "\n操作中断：上面这一步执行失败（脚本第 %s 行），部分配置可能已经修改。\n请保留当前 SSH 连接，用主菜单 2 查看状态后再重试。\n" "$LINENO" >&2' ERR
 [[ $EUID -eq 0 ]] || die '需要 root 权限，请用 sudo vpsfw 运行。'
-if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login|ping)$ ]]; then
+if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login|ping|docker)$ ]]; then
     [[ -t 0 ]] || die '请下载脚本后在交互终端运行，不要通过管道运行。'
 fi
 . /etc/os-release
@@ -2150,6 +2403,12 @@ case "$mode" in
         if [[ $mode == passwd ]]; then change_password "${dispatch_args[0]:-${auth_user:-${SUDO_USER:-root}}}"
         else manage_keys "${dispatch_args[0]:-${auth_user:-${SUDO_USER:-root}}}"; fi
         exit 0 ;;
+    docker)
+        [[ ${#dispatch_args[@]} == 1 && ( ${dispatch_args[0]} == on || ${dispatch_args[0]} == off ) ]] || die '用法：docker on|off'
+        docker_switch "${dispatch_args[0]}"; exit 0 ;;
+    fail2ban-mode)
+        (( ${#dispatch_args[@]} == 1 )) || die '用法：fail2ban-mode normal|extra|aggressive'
+        f2b_set_mode "${dispatch_args[0]}"; exit 0 ;;
     ping)
         [[ ${#dispatch_args[@]} == 1 && ( ${dispatch_args[0]} == on || ${dispatch_args[0]} == off ) ]] || die '用法：ping off|on'
         ping_switch "${dispatch_args[0]}"; exit 0 ;;
@@ -2222,7 +2481,10 @@ printf '  · 放行 SSH 端口 %s/TCP，拒绝其他未放行的入站连接（I
 printf '  · SSH 登录 5 分钟内失败 5 次（包括拿真实用户名反复试密钥），封禁该 IP 10 分钟\n'
 printf '  · 保留已有的 UFW 规则；备份后覆盖 /etc/fail2ban/jail.d/sshd.local\n'
 printf '\n不修改 SSH 端口；其他端口初始化后在主菜单 3「端口访问管理」里放行。\n'
-printf '不适合 Docker 端口映射、NAT 转发、VPN 网关或已有复杂防火墙的服务器。\n'
+printf '不适合 NAT 转发、VPN 网关或已有复杂防火墙的服务器。\n'
+if command -v docker >/dev/null && ! docker_managed; then
+    printf '检测到 Docker：它映射的端口不受 UFW 控制，初始化后可在「端口访问管理」里接管。\n'
+fi
 printf '建议先打开服务商网页控制台备用，万一连不上可以从那里恢复。\n\n'
 if (( reinit )); then confirm '仍要重新初始化？' || cancel '没有修改任何配置'
 else confirm '开始初始化？' || cancel '没有修改任何配置'; fi
@@ -2307,6 +2569,7 @@ ufw default allow outgoing
 ufw logging low
 ufw --force enable
 ufw reload
+docker_sync
 systemctl enable --quiet ufw
 
 systemctl enable --quiet fail2ban
