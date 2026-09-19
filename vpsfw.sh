@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Firewall — Debian 13, directly installed services.
+# VPS Firewall — Debian 11–14 and Ubuntu 20.04 / 22.04, directly installed services.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C.UTF-8
@@ -25,7 +25,7 @@ confirm() {
 }
 usage() {
     cat <<'HELP'
-VPS Firewall — Debian 13 服务器安全与端口管理
+VPS Firewall — Debian / Ubuntu 服务器安全与端口管理
 用法：
   vpsfw                              # 彩色菜单
   vpsfw install                      # 初始化 UFW + Fail2ban
@@ -54,9 +54,17 @@ ports change 旧端口或范围 新端口或范围 [tcp|udp|both] [来源IP/CIDR
 删除/替换按端口、协议和来源精确匹配普通入站放行规则，无需专用标记。
 范围规则须整体删除；SSH 入口通过专用菜单管理。
 初始化仅放行 SSH，其他端口通过端口管理添加。保留已有 UFW 规则。
-适用 Debian 13 宿主机入站流量；不管理应用、容器映射和路由转发。
+适用 Debian 11–14、Ubuntu 20.04 / 22.04 宿主机入站流量；不管理应用、容器映射和路由转发。
 SSH 迁移仅支持标准 ssh.service，保留新旧入口直到新会话确认。
 HELP
+}
+# Systems whose ssh, ufw, fail2ban and Python versions this script has been checked against.
+supported_os() {
+    case ${ID:-} in
+        debian) [[ ${VERSION_ID:-} =~ ^(11|12|13|14)$ || ${VERSION_CODENAME:-} == forky ]] ;;
+        ubuntu) [[ ${VERSION_ID:-} == 20.04 || ${VERSION_ID:-} == 22.04 ]] ;;
+        *) return 1 ;;
+    esac
 }
 valid_port() {
     [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 ))
@@ -1367,7 +1375,7 @@ menu_draw() {
 LOGO
         printf '%s' "$reset"
     fi
-    printf '\n  %sVPS Firewall  ·  Debian 13%s\n' "$bold" "$reset"
+    printf '\n  %sVPS Firewall  ·  %s %s%s\n' "$bold" "${NAME%% *}" "${VERSION_ID:-}" "$reset"
     printf '  %s服务器端口与 SSH 管理%s\n\n' "$dim" "$reset"
     menu_rule
     if (( wide )); then
@@ -1703,7 +1711,7 @@ if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login|ping)$ ]];
     [[ -t 0 ]] || die '请下载脚本后在交互终端运行，不要通过管道运行。'
 fi
 . /etc/os-release
-[[ ${ID:-} == debian && ${VERSION_ID:-} == 13 ]] || die '此脚本针对 Debian 13。'
+supported_os || die '此脚本支持 Debian 11–14 和 Ubuntu 20.04 / 22.04。'
 [[ -d /run/systemd/system ]] || die '需要使用 systemd 的系统。'
 
 session_port='' server_addr='' client_addr='' client_port=''

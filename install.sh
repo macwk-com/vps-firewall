@@ -6,7 +6,11 @@ umask 077
 fail() { printf '\n安装失败：%s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail '请以 root 运行安装命令。'
 . /etc/os-release
-[[ ${ID:-} == debian && ${VERSION_ID:-} == 13 ]] || fail '目前支持 Debian 13。'
+case ${ID:-} in
+    debian) [[ ${VERSION_ID:-} =~ ^(11|12|13|14)$ || ${VERSION_CODENAME:-} == forky ]] ;;
+    ubuntu) [[ ${VERSION_ID:-} == 20.04 || ${VERSION_ID:-} == 22.04 ]] ;;
+    *) false ;;
+esac || fail '目前支持 Debian 11–14 和 Ubuntu 20.04 / 22.04。'
 command -v curl >/dev/null || fail '请先安装 curl 和 ca-certificates。'
 
 repo='macwk-com/vps-firewall'
