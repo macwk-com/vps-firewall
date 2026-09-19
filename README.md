@@ -99,7 +99,7 @@ bash vpsfw.sh
 ## 各系统的差异
 
 - **Rocky / AlmaLinux**：UFW 和 Fail2ban 从 EPEL 源安装。初始化会停用系统自带的 firewalld、改由 UFW 管理，firewalld 原来放行的端口和服务（如 http）会自动搬到 UFW；firewalld 里更复杂的规则（按来源、端口转发等）不会搬，需要自己核对。这类系统的 sudo 不搜索 `/usr/local/bin`，一键安装会在 `/usr/bin/vpsfw` 放一个链接，普通用户照样用 `sudo vpsfw`。
-- **Debian 10**：已停止维护，软件源搬到了 `archive.debian.org`，初始化前需要先改好 `/etc/apt/sources.list`。
+- **Debian 10、11**：已停止维护，软件源搬到了 `archive.debian.org`，初始化前需要先改好 `/etc/apt/sources.list`。
 - **登录记录**：Debian 10 和 Rocky / AlmaLinux 默认只把系统日志保存在内存里，菜单 10 只能看到这次开机以来的记录。
 
 ## SSH 登录方式（菜单 11）

@@ -1897,12 +1897,12 @@ if (( reinit )); then confirm '仍要重新初始化？' || cancel '没有修改
 else confirm '开始初始化？' || cancel '没有修改任何配置'; fi
 
 if command -v apt-get >/dev/null; then
-    if ! apt-get update; then
-        [[ ${ID:-} != debian || ${VERSION_ID:-} != 10 ]] ||
-            die 'Debian 10 已停止维护，软件源搬到了 archive.debian.org，请先把 /etc/apt/sources.list 里的地址改过去。'
-        die '软件源更新失败，请检查网络和 /etc/apt/sources.list。'
+    if ! { apt-get update && apt-get install -y ufw fail2ban python3 python3-systemd nftables iproute2 util-linux; }; then
+        # Debian 10 and 11 are out of support; their packages moved to archive.debian.org.
+        [[ ${ID:-} != debian || ! ${VERSION_ID:-} =~ ^(10|11)$ ]] ||
+            die "Debian ${VERSION_ID} 已停止维护，软件源搬到了 archive.debian.org，请先把 /etc/apt/sources.list 里的地址改过去。"
+        die '软件安装失败，请检查网络和 /etc/apt/sources.list。'
     fi
-    apt-get install -y ufw fail2ban python3 python3-systemd nftables iproute2 util-linux
 else
     # Rocky and AlmaLinux: ufw and fail2ban come from EPEL; semanage labels new SSH ports for SELinux.
     dnf install -y epel-release
