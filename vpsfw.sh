@@ -320,13 +320,16 @@ wait_f2b() {
     journalctl -u fail2ban -n 30 --no-pager >&2 || true
     return 1
 }
+# aggressive also counts attempts that end before authentication, such as trying keys against a real
+# account after password login is off; normal mode never bans those. Plain TCP probes barely count.
+F2B_FILTER='sshd[mode=aggressive]'
 write_f2b() {
     local target_ports=$1
     mkdir -p /etc/fail2ban/jail.d
     cat > /etc/fail2ban/jail.d/sshd.local <<EOF || return 1
 [sshd]
 enabled = true
-filter = sshd
+filter = $F2B_FILTER
 port = $target_ports
 backend = systemd
 maxretry = 5
@@ -1885,7 +1888,7 @@ if ! command -v apt-get >/dev/null; then
     printf '  · 从 EPEL 源安装软件，停用系统自带的 firewalld，改由 UFW 管理；firewalld 原来放行的端口会搬到 UFW\n'
 fi
 printf '  · 放行 SSH 端口 %s/TCP，拒绝其他未放行的入站连接（IPv4 和 IPv6），出站不限\n' "$ssh_port"
-printf '  · SSH 登录 5 分钟内失败 5 次，封禁该 IP 10 分钟\n'
+printf '  · SSH 登录 5 分钟内失败 5 次（包括拿真实用户名反复试密钥），封禁该 IP 10 分钟\n'
 printf '  · 保留已有的 UFW 规则；备份后覆盖 /etc/fail2ban/jail.d/sshd.local\n'
 printf '\n不修改 SSH 端口；其他端口初始化后用菜单 3 添加。\n'
 printf '不适合 Docker 端口映射、NAT 转发、VPN 网关或已有复杂防火墙的服务器。\n'
