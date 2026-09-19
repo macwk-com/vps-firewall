@@ -1,21 +1,34 @@
 # VPS Firewall
 
-只管理服务器端口和 SSH：UFW 负责入站放行规则，Fail2ban 负责 SSH 登录失败封禁。适用于 Debian 11–14 和 Ubuntu 20.04 / 22.04。
+只管理服务器端口和 SSH：UFW 负责入站放行规则，Fail2ban 负责 SSH 登录失败封禁。支持的系统：
+
+| 系统 | 版本 |
+|---|---|
+| Debian | 10 11 12 13 14 |
+| Ubuntu | 18.04 20.04 22.04 24.04 26.04 |
+| Rocky Linux | 8 9 10 |
+| AlmaLinux | 8 9 10 |
 
 ## 一键安装
 
 仓库须公开，以下文件放在 `main` 分支根目录：`install.sh`、`vpsfw.sh`、`README.md`。
 
-在 Debian 11–14 或 Ubuntu 20.04 / 22.04 的 VPS 上以 root 执行；需要已安装 `curl` 和 CA 证书：
+在上面这些系统的 VPS 上以 root 执行；需要已安装 `curl` 和 CA 证书：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/macwk-com/vps-firewall/main/install.sh)
 ```
 
-如果提示找不到 curl，先执行：
+如果提示找不到 curl，Debian / Ubuntu 先执行：
 
 ```bash
 apt update && apt install -y curl ca-certificates
+```
+
+Rocky / AlmaLinux 先执行：
+
+```bash
+dnf install -y curl ca-certificates
 ```
 
 安装脚本下载主程序，检查 Bash 语法后保存为 `/usr/local/bin/vpsfw`，并打开菜单。安装快捷命令本身不会修改防火墙或 SSH 配置。
@@ -39,7 +52,7 @@ bash install.sh
 下面命令行示例中的 `bash vpsfw.sh`，安装后也可以直接写成 `vpsfw`。
 
 
-适用于 Debian 11–14、Ubuntu 20.04 / 22.04 宿主机入站流量和标准 `ssh.service`，不管理应用或代理配置。主界面是终端彩色数字菜单，不需要安装图形桌面。
+适用于宿主机入站流量和系统自带的 SSH 服务，不管理应用或代理配置。主界面是终端彩色数字菜单，不需要安装图形桌面。
 
 ## 使用
 
@@ -81,7 +94,13 @@ bash vpsfw.sh
 
 发生配置检查、重载或服务启动错误时，迁移过程会尝试恢复 SSH 和 Fail2ban 配置。新增的 UFW 放行规则保留，便于恢复访问。断电、强制终止等情况无法保证自动回退，请保留服务商网页控制台入口。
 
-脚本针对标准 Debian SSH 服务。检测到 `ssh.socket`、自定义启动参数、非标准 `Include`、自定义 `ListenAddress` 或配置软链接时，会停止自动迁移并说明原因，不强行改写。脚本不会更改 SSH 的认证方式。
+脚本针对系统自带的 SSH 服务：Debian / Ubuntu 的 `ssh.service`、Rocky / AlmaLinux 的 `sshd.service`，以及 Ubuntu 22.10 以后默认的 socket 启动方式（改端口时由 systemd 重新生成监听，已连着的窗口不受影响）。检测到按连接启动的 socket 模式、会改端口的自定义启动参数、非标准 `Include`、自定义 `ListenAddress` 或配置软链接时，会停止自动迁移并说明原因，不强行改写。开着 SELinux 的系统会自动给新 SSH 端口登记 `ssh_port_t`。脚本不会更改 SSH 的认证方式。
+
+## 各系统的差异
+
+- **Rocky / AlmaLinux**：UFW 和 Fail2ban 从 EPEL 源安装。初始化会停用系统自带的 firewalld、改由 UFW 管理，firewalld 原来放行的端口和服务（如 http）会自动搬到 UFW；firewalld 里更复杂的规则（按来源、端口转发等）不会搬，需要自己核对。这类系统的 sudo 不搜索 `/usr/local/bin`，一键安装会在 `/usr/bin/vpsfw` 放一个链接，普通用户照样用 `sudo vpsfw`。
+- **Debian 10**：已停止维护，软件源搬到了 `archive.debian.org`，初始化前需要先改好 `/etc/apt/sources.list`。
+- **登录记录**：Debian 10 和 Rocky / AlmaLinux 默认只把系统日志保存在内存里，菜单 10 只能看到这次开机以来的记录。
 
 ## SSH 登录方式（菜单 11）
 
@@ -165,4 +184,4 @@ fail2ban-client set sshd unbanip 你的公网IP
 
 ## 验证范围
 
-已完成 Bash 语法检查、隔离文件下的真实 OpenSSH 配置检查，以及端口管理、双端口迁移、会话确认、重载失败回退的模拟测试。另在带 systemd 的 Debian 12 和 13 容器里，通过真实 SSH 登录（root 和 sudo 普通用户）跑通了空规则初始化、重复初始化、菜单增删改端口、SSH 迁移确认与回退、防火墙开关。尚未在真实 VPS 上验证。
+已完成 Bash 语法检查、隔离文件下的真实 OpenSSH 配置检查，以及端口管理、双端口迁移、会话确认、重载失败回退的模拟测试。另在带 systemd 的 Debian 12、13，Ubuntu 24.04（socket 模式），Rocky 8、9 容器里，通过真实 SSH 登录跑通了初始化、端口管理、SSH 端口迁移、开关密码登录、禁止 ping 和登录记录；Rocky 上还验证了 firewalld 端口搬迁。其他版本按各自的 OpenSSH、UFW、Fail2ban、Python 版本分析兼容。容器里没有 SELinux，给新端口登记 `ssh_port_t` 这一步按 RHEL 文档实现、未实测。尚未在真实 VPS 上验证。

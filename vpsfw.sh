@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPS Firewall — Debian 11–14 and Ubuntu 20.04 / 22.04, directly installed services.
+# VPS Firewall — Debian 10–14, Ubuntu 18.04–26.04, Rocky and AlmaLinux 8–10; directly installed services.
 set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C.UTF-8
@@ -25,7 +25,7 @@ confirm() {
 }
 usage() {
     cat <<'HELP'
-VPS Firewall — Debian / Ubuntu 服务器安全与端口管理
+VPS Firewall — Linux 服务器安全与端口管理
 用法：
   vpsfw                              # 彩色菜单
   vpsfw install                      # 初始化 UFW + Fail2ban
@@ -54,15 +54,16 @@ ports change 旧端口或范围 新端口或范围 [tcp|udp|both] [来源IP/CIDR
 删除/替换按端口、协议和来源精确匹配普通入站放行规则，无需专用标记。
 范围规则须整体删除；SSH 入口通过专用菜单管理。
 初始化仅放行 SSH，其他端口通过端口管理添加。保留已有 UFW 规则。
-适用 Debian 11–14、Ubuntu 20.04 / 22.04 宿主机入站流量；不管理应用、容器映射和路由转发。
-SSH 迁移仅支持标准 ssh.service，保留新旧入口直到新会话确认。
+适用 Debian 10–14、Ubuntu 18.04–26.04、Rocky / AlmaLinux 8–10 宿主机入站流量；不管理应用、容器映射和路由转发。
+SSH 迁移支持系统自带的 SSH 服务（含 Ubuntu 的 socket 模式），保留新旧入口直到新会话确认。
 HELP
 }
 # Systems whose ssh, ufw, fail2ban and Python versions this script has been checked against.
 supported_os() {
     case ${ID:-} in
-        debian) [[ ${VERSION_ID:-} =~ ^(11|12|13|14)$ || ${VERSION_CODENAME:-} == forky ]] ;;
-        ubuntu) [[ ${VERSION_ID:-} == 20.04 || ${VERSION_ID:-} == 22.04 ]] ;;
+        debian) [[ ${VERSION_ID:-} =~ ^(10|11|12|13|14)$ || ${VERSION_CODENAME:-} == forky ]] ;;
+        ubuntu) [[ ${VERSION_ID:-} =~ ^(18|20|22|24|26)\.04$ ]] ;;
+        rocky|almalinux) [[ ${VERSION_ID%%.*} =~ ^(8|9|10)$ ]] ;;
         *) return 1 ;;
     esac
 }
@@ -262,6 +263,35 @@ PYBACKUP
 # SSH changes are transactions. Keep the previous listener until a new-port session confirms.
 STATE_DIR=/var/lib/vps-security
 PENDING_FILE=$STATE_DIR/ssh-pending
+# Debian and Ubuntu call the service ssh, RHEL-family systems sshd; set for real in the entry point.
+SSH_UNIT=ssh.service SSH_SOCKET_UNIT=ssh.socket
+# Ubuntu 22.10+ lets systemd own the SSH sockets (Accept=no) and builds them from sshd_config.
+ssh_socket_mode() {
+    systemctl is-enabled --quiet "$SSH_SOCKET_UNIT" 2>/dev/null || systemctl is-active --quiet "$SSH_SOCKET_UNIT"
+}
+# Make sshd use a changed configuration; open connections stay up either way.
+# In socket mode the service requires the socket, so restarting the socket also stops sshd, and the
+# next connection starts it with the new settings. Restarting sshd on top of that races the
+# activation and trips systemd's start limit, which takes the socket down with it.
+ssh_reload() {
+    if ssh_socket_mode; then
+        systemctl reset-failed "$SSH_UNIT" "$SSH_SOCKET_UNIT" 2>/dev/null || true
+        systemctl daemon-reload && systemctl restart "$SSH_SOCKET_UNIT" && systemctl is-active --quiet "$SSH_SOCKET_UNIT"
+    else
+        systemctl reload "$SSH_UNIT"
+    fi
+}
+# SELinux only lets sshd bind ports labelled ssh_port_t (Rocky, AlmaLinux).
+selinux_allow_ports() {
+    command -v selinuxenabled >/dev/null && selinuxenabled || return 0
+    command -v semanage >/dev/null || die 'SELinux 已启用，但缺少 semanage（policycoreutils-python-utils），无法给新 SSH 端口登记。'
+    local p labelled
+    labelled=$(semanage port -l | awk '$1 == "ssh_port_t" && $2 == "tcp" {for (i = 3; i <= NF; i++) print $i}' | tr -d ,)
+    for p in ${1//,/ }; do
+        [[ $'\n'$labelled$'\n' != *$'\n'"$p"$'\n'* ]] || continue
+        semanage port -a -t ssh_port_t -p tcp "$p" 2>/dev/null || semanage port -m -t ssh_port_t -p tcp "$p"
+    done
+}
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
 
 need_tools() {
@@ -309,7 +339,7 @@ EOF
     local out
     out=$(fail2ban-client -t 2>&1) || { printf '%s\n' "$out" >&2; return 1; }
 }
-# Restrict automated rewrites to standard Debian includes. Snapshot exactly the files edited.
+# Restrict automated rewrites to the includes distributions ship. Snapshot exactly the files edited.
 ssh_config_files() {
     python3 - "$@" <<'PY'
 import sys, pathlib, re, json, base64, os, tempfile, shlex
@@ -338,7 +368,9 @@ for p in files:
         words = shlex.split(line, comments=True)
         if not words: continue
         key = words[0].lower()
-        if key == 'include' and not (p == main and words[1:] == ['/etc/ssh/sshd_config.d/*.conf']):
+        # RHEL-family systems pull in the system crypto policy, which only sets algorithms.
+        if key == 'include' and not (p == main and words[1:] == ['/etc/ssh/sshd_config.d/*.conf']) \
+                and words[1:] != ['/etc/crypto-policies/back-ends/opensshserver.config']:
             raise SystemExit(f'发现非标准 Include，已停止：{p}: {line}')
         if key == 'listenaddress':
             raise SystemExit('存在自定义 ListenAddress，请先人工确认地址绑定；未修改 SSH。')
@@ -363,27 +395,42 @@ PY
 ssh_preflight() {
     need_tools
     [[ ! -e $PENDING_FILE || ${1:-} == pending ]] || die '有尚未完成的 SSH 迁移，请先确认或回退。'
-    if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket; then
-        die '检测到 ssh.socket 激活模式。脚本不会自动切换服务模式，SSH 配置未修改。'
+    if ssh_socket_mode; then
+        [[ $(systemctl show -p Accept --value "$SSH_SOCKET_UNIT") == no ]] ||
+            die "$SSH_SOCKET_UNIT 是每个连接单独启动 sshd 的模式，脚本不会自动修改，SSH 配置未改动。"
+    else
+        systemctl is-active --quiet "$SSH_UNIT" || die "$SSH_UNIT 没有运行。"
     fi
-    systemctl is-active --quiet ssh.service || die 'ssh.service 没有运行。'
     sshd -t
-    local start environment
-    start=$(systemctl cat ssh.service | awk '/^ExecStart=./ {line=$0} END {print line}')
-    [[ $start == 'ExecStart=/usr/sbin/sshd -D $SSHD_OPTS' || $start == 'ExecStart=/usr/sbin/sshd -D' ]] || die 'SSH 使用自定义启动命令，无法安全自动改端口。'
-    environment=$(systemctl show ssh.service -p Environment --value)
-    [[ $environment != *SSHD_OPTS=* ]] || die 'SSH 服务有额外 SSHD_OPTS 环境配置，请先人工检查。'
-    python3 - <<'PY'
-import pathlib, shlex
-p=pathlib.Path('/etc/default/ssh')
-if p.exists():
-    for line in p.read_text().splitlines():
-        words=shlex.split(line, comments=True)
-        if not words: continue
-        if words[0] == 'export': words=words[1:]
-        for word in words:
-            if word.startswith('SSHD_OPTS=') and word != 'SSHD_OPTS=':
-                raise SystemExit('存在非空 SSHD_OPTS，自定义 SSH 启动配置需人工处理。')
+    local start
+    start=$(systemctl cat "$SSH_UNIT" | awk '/^ExecStart=./ {line=$0} END {print line}')
+    case $start in
+        'ExecStart=/usr/sbin/sshd -D' | 'ExecStart=/usr/sbin/sshd -D $SSHD_OPTS' | 'ExecStart=/usr/sbin/sshd -D $OPTIONS' | \
+        'ExecStart=/usr/sbin/sshd -D $OPTIONS $CRYPTO_POLICY') ;;
+        *) die 'SSH 使用自定义启动命令，无法安全自动修改。' ;;
+    esac
+    # Extra start options may carry crypto settings, but must not pick ports, addresses or a config file.
+    python3 - "$(systemctl show "$SSH_UNIT" -p Environment --value)" <<'PY'
+import pathlib, re, shlex, sys
+def risky(value):
+    words = shlex.split(value)
+    for i, word in enumerate(words):
+        if word.startswith(('-p', '-f')): return True
+        if word.startswith('-o'):
+            option = word[2:] or (words[i + 1] if i + 1 < len(words) else '')
+            if re.split(r'[=\s]', option.strip())[0].lower() in ('port', 'listenaddress'): return True
+    return False
+def check(words, where):
+    for word in words:
+        for name in ('SSHD_OPTS', 'OPTIONS'):
+            if word.startswith(name + '=') and risky(word[len(name) + 1:]):
+                raise SystemExit(f'{where} 的 {name} 指定了 SSH 端口、监听地址或配置文件，需人工处理。')
+check(shlex.split(sys.argv[1]), 'SSH 服务')
+for path in ('/etc/default/ssh', '/etc/sysconfig/sshd'):
+    p = pathlib.Path(path)
+    if p.exists():
+        for line in p.read_text().splitlines():
+            check(shlex.split(line, comments=True), path)
 PY
 }
 ssh_snapshot() {
@@ -406,7 +453,7 @@ restore_ssh_backup() {
         cp -a "$source/sshd.local" /etc/fail2ban/jail.d/sshd.local || return 1
     fi
     sshd -t || return 1
-    systemctl reload ssh.service || return 1
+    ssh_reload || return 1
     systemctl restart fail2ban || return 1
     wait_f2b
 }
@@ -452,8 +499,9 @@ apply_ssh_ports() {
     done
     ssh_config_files edit "$backup_dir" "$target_ports"
     sshd -t
+    selinux_allow_ports "$target_ports"
     write_f2b "$target_ports"
-    systemctl reload ssh.service
+    ssh_reload
     verify_ssh_ports "$target_ports"
     systemctl enable --quiet fail2ban
     systemctl restart fail2ban
@@ -723,7 +771,7 @@ show_logins() {
         banned=$(fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p') || banned=''
     fi
     python3 - "$days" "$banned" "$c_ok" "$c_warn" "$c_err" "$c_dim" "$c_head" "$c_off" <<'PY'
-import glob, gzip, json, re, subprocess, sys, time, unicodedata
+import glob, gzip, json, os, re, subprocess, sys, time, unicodedata
 from collections import Counter, defaultdict
 days = int(sys.argv[1]); banned = set(sys.argv[2].split())
 ok, warn, err, dim, head, off = sys.argv[3:9]
@@ -739,7 +787,8 @@ def section(title):
     print(f'\n  {head}{title}{off}')
 
 journal = subprocess.run(['journalctl', '-u', 'ssh.service', '-u', 'sshd.service', '--since', f'{days} days ago',
-                          '-o', 'json', '--no-pager'], capture_output=True, text=True).stdout
+                          '-o', 'json', '--no-pager'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         universal_newlines=True).stdout
 accepted = re.compile(r'Accepted (\S+) for (\S+) from (\S+) port')
 failed = re.compile(r'Failed \S+ for (?:invalid user )?(.*?) from (\S+) port')
 invalid = re.compile(r'Invalid user (.*?) from (\S+) port')
@@ -757,17 +806,20 @@ for line in journal.splitlines():
     if isinstance(message, list): message = bytes(message).decode('utf-8', 'replace')
     if not isinstance(message, str): continue
     when = int(entry.get('__REALTIME_TIMESTAMP', 0)) / 1e6
-    if m := penalty.search(message):
+    m = penalty.search(message)
+    if m:
         dropped[m.group(1)] += 1
         continue
     conn = connections[(entry.get('_BOOT_ID'), entry.get('_PID'))]
-    if m := accepted.search(message):
+    m = accepted.search(message)
+    if m:
         method, user, ip = m.groups()
         successes.append((when, user, ip, {'publickey': '密钥', 'password': '密码'}.get(method, method)))
         conn['accepted'] = True
         continue
     for pattern in (failed, invalid, closed):
-        if m := pattern.search(message):
+        m = pattern.search(message)
+        if m:
             user, ip = m.groups()
             conn.update(ip=ip, user=user, last=when)
             if pattern is failed: conn['fails'] += 1
@@ -786,6 +838,9 @@ for conn in connections.values():
 shown = [ip for _, _, ip, _ in successes[-20:]] + [ip for ip, _ in attempts.most_common(10)]
 ip_cells = max([width('来源 IP')] + [width(ip) for ip in shown]) + 3
 print(f'\n  {head}SSH 登录记录 · 最近 {days} 天{off}')
+# Debian 10 and RHEL-family systems keep the journal in memory unless /var/log/journal exists.
+if not os.path.isdir('/var/log/journal'):
+    print(f'  {dim}这台服务器的系统日志没有保存到磁盘，只能看到这次开机以来的记录。{off}')
 section(f'成功登录（{len(successes)} 次）')
 if successes:
     print(f"  {dim}{pad('时间', 14)}{pad('用户', 10)}{pad('来源 IP', ip_cells)}方式{off}")
@@ -819,7 +874,8 @@ for path in glob.glob('/var/log/fail2ban.log*'):
                 if not m: continue
                 when = time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
                 oldest = when if oldest is None else min(oldest, when)
-                if when >= since and (ban := re.search(r'\[sshd\] Ban (\S+)', line)): bans.append(ban.group(1))
+                ban = re.search(r'\[sshd\] Ban (\S+)', line)
+                if when >= since and ban: bans.append(ban.group(1))
     except (OSError, EOFError):
         continue
 note = f'（Fail2ban 日志最早只到 {stamp(oldest)}）' if oldest and oldest > since + 86400 else ''
@@ -840,12 +896,12 @@ menu_logins() {
 # discovery) keeps working, and so does pinging out from this server. ──
 PING_V4='-A ufw-before-input -p icmp --icmp-type echo-request -j'
 PING_V6='-A ufw6-before-input -p icmpv6 --icmpv6-type echo-request -j'
-# ACCEPT or DROP from a rules file, or nothing when the line is missing, duplicated or edited.
+# ACCEPT or DROP from a rules file, or nothing when the line is missing or its copies disagree
+# (older ufw repeats the IPv6 line).
 ping_rule() {
-    local count
-    count=$(grep -c -F -x -e "$2 ACCEPT" -e "$2 DROP" "$1" 2>/dev/null || true)
-    [[ $count == 1 ]] || return 0
-    grep -F -x -e "$2 ACCEPT" -e "$2 DROP" "$1" | awk '{print $NF}'
+    local actions
+    actions=$(grep -F -x -e "$2 ACCEPT" -e "$2 DROP" "$1" 2>/dev/null | awk '{print $NF}' | sort -u) || true
+    if [[ $actions == ACCEPT || $actions == DROP ]]; then printf '%s\n' "$actions"; fi
 }
 # Sets REPLY to allowed, blocked, mixed or unknown.
 ping_state() {
@@ -923,7 +979,8 @@ session_auth() {
 password_state() {
     local fields=()
     read -r -a fields <<< "$(passwd -S "$1" 2>/dev/null)" || true
-    if [[ ${fields[1]:-} == P ]]; then REPLY="有密码（${fields[2]:-?} 修改）"; else REPLY='没有密码'; fi
+    # Debian prints P, RHEL-family systems PS.
+    if [[ ${fields[1]:-} == P || ${fields[1]:-} == PS ]]; then REPLY="有密码（${fields[2]:-?} 修改）"; else REPLY='没有密码'; fi
 }
 # Public keys in an authorized_keys file: list them, check a pasted line, or remove one by number.
 key_tool() {
@@ -933,15 +990,20 @@ op, *args = sys.argv[1:]
 def fingerprint(line):
     with tempfile.NamedTemporaryFile('w', suffix='.pub') as f:
         f.write(line + '\n'); f.flush()
-        result = subprocess.run(['ssh-keygen', '-l', '-f', f.name], capture_output=True, text=True)
+        result = subprocess.run(['ssh-keygen', '-l', '-f', f.name], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, universal_newlines=True)
     if result.returncode or not result.stdout.strip(): return None
     _, fp, *rest = result.stdout.split()
     return fp, (rest[-1].strip('()') if rest else '?'), ' '.join(rest[:-1])
 def keys(path):
     try: lines = open(path).read().splitlines()
     except FileNotFoundError: lines = []
-    return lines, [(i, info) for i, line in enumerate(lines)
-                   if line.strip() and not line.lstrip().startswith('#') and (info := fingerprint(line.strip()))]
+    found = []
+    for i, line in enumerate(lines):
+        if line.strip() and not line.lstrip().startswith('#'):
+            info = fingerprint(line.strip())
+            if info: found.append((i, info))
+    return lines, found
 if op == 'list':
     for number, (_, (fp, kind, comment)) in enumerate(keys(args[0])[1], 1):
         print(number, kind, fp, comment or '-', sep='\t')
@@ -1118,11 +1180,15 @@ manage_keys() {
     printf '已删除。用这把密钥的电脑以后就不能再登录 %s 了。\n' "$user"
 }
 password_login() {
-    local want=$1 expected=no current content backup='' user with_keys=''
+    local want=$1 expected=no current content backup='' user with_keys='' target=$AUTH_CONF kbd main=/etc/ssh/sshd_config
     [[ $want == off ]] || expected=yes
     ssh_preflight pending
-    grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config ||
-        die 'SSH 主配置没有引入 /etc/ssh/sshd_config.d，无法安全修改，SSH 配置未改动。'
+    # Without an sshd_config.d include the setting goes into a marked block at the top of the main file,
+    # where it is read before anything else.
+    grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$main" || target=$main
+    # OpenSSH before 8.7 only knows the old name of the keyboard-interactive switch.
+    kbd=ChallengeResponseAuthentication
+    if sshd -T 2>/dev/null | grep -q '^kbdinteractiveauthentication '; then kbd=KbdInteractiveAuthentication; fi
     current=$(sshd_value passwordauthentication) || current=''
     if [[ $current == "$expected" ]]; then
         if [[ $want == off ]]; then printf 'SSH 密码登录本来就是关闭的。\n'; else printf 'SSH 密码登录本来就是允许的。\n'; fi
@@ -1142,18 +1208,31 @@ password_login() {
         fi
         printf '关闭后所有用户（包括 root）都只能用密钥登录，猜密码的攻击会全部失效；已经连着的窗口不受影响。\n'
         confirm '关闭 SSH 密码登录？' y || cancel
-        content=$'# Managed by vpsfw: SSH password login is off.\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n'
+        content=$'# Managed by vpsfw: SSH password login is off.\nPasswordAuthentication no\n'"$kbd no"$'\n'
     else
         printf '打开后用户可以用密码登录 SSH，root 是否能用密码仍按原来的设置。\n'
         confirm '打开 SSH 密码登录？' || cancel
         content=$'# Managed by vpsfw: SSH password login is on.\nPasswordAuthentication yes\n'
     fi
-    [[ ! -e $AUTH_CONF ]] || backup=$(cat "$AUTH_CONF")
-    # Files in sshd_config.d are read before the main config and the first value wins, so this one takes effect.
-    printf '%s' "$content" > "$AUTH_CONF.tmp" && chmod 644 "$AUTH_CONF.tmp" && mv -f "$AUTH_CONF.tmp" "$AUTH_CONF"
-    if ! sshd -t || ! systemctl reload ssh.service || [[ $(sshd_value passwordauthentication) != "$expected" ]]; then
-        if [[ -n $backup ]]; then printf '%s\n' "$backup" > "$AUTH_CONF"; else rm -f "$AUTH_CONF"; fi
-        sshd -t && systemctl reload ssh.service || true
+    [[ ! -e $target ]] || backup=$(cat "$target"; printf x)
+    if [[ $target == "$AUTH_CONF" ]]; then
+        # Files in sshd_config.d are read before the main config and the first value wins, so this one takes effect.
+        printf '%s' "$content" > "$AUTH_CONF.tmp" && chmod 644 "$AUTH_CONF.tmp" && mv -f "$AUTH_CONF.tmp" "$AUTH_CONF"
+    else
+        python3 - "$main" "$content" <<'PY'
+import os, re, sys
+path, content = sys.argv[1:]
+text = open(path).read()
+text = re.sub(r'^# BEGIN VPSFW AUTH\n.*?^# END VPSFW AUTH\n?', '', text, flags=re.M | re.S)
+block = '# BEGIN VPSFW AUTH\n' + content + '# END VPSFW AUTH\n'
+tmp = path + '.vpsfw-tmp'
+with open(tmp, 'w') as f: f.write(block + text)
+os.chmod(tmp, os.stat(path).st_mode & 0o777); os.replace(tmp, path)
+PY
+    fi
+    if ! sshd -t || ! ssh_reload || [[ $(sshd_value passwordauthentication) != "$expected" ]]; then
+        if [[ -n $backup ]]; then printf '%s' "${backup%x}" > "$target"; else rm -f "$target"; fi
+        sshd -t && ssh_reload || true
         die '修改没有生效，已恢复原来的设置。'
     fi
     if [[ $want == off ]]; then printf 'SSH 密码登录已关闭，现在只能用密钥登录。\n'
@@ -1711,8 +1790,12 @@ if [[ $mode =~ ^(install|menu|ssh|firewall|passwd|keys|password-login|ping)$ ]];
     [[ -t 0 ]] || die '请下载脚本后在交互终端运行，不要通过管道运行。'
 fi
 . /etc/os-release
-supported_os || die '此脚本支持 Debian 11–14 和 Ubuntu 20.04 / 22.04。'
+supported_os || die '此脚本支持 Debian 10–14、Ubuntu 18.04–26.04、Rocky / AlmaLinux 8–10。'
 [[ -d /run/systemd/system ]] || die '需要使用 systemd 的系统。'
+systemctl cat ssh.service >/dev/null 2>&1 || SSH_UNIT=sshd.service
+SSH_SOCKET_UNIT=${SSH_UNIT%.service}.socket
+# Backups live in /var/backups, which only Debian-family systems create.
+mkdir -p /var/backups
 
 session_port='' server_addr='' client_addr='' client_port=''
 connection=$(ssh_connection)
@@ -1798,6 +1881,9 @@ if command -v ufw >/dev/null && [[ $(ufw status 2>/dev/null) == 'Status: active'
 fi
 printf '\n初始化将会：\n'
 printf '  · 安装 UFW 和 Fail2ban\n'
+if ! command -v apt-get >/dev/null; then
+    printf '  · 从 EPEL 源安装软件，停用系统自带的 firewalld，改由 UFW 管理；firewalld 原来放行的端口会搬到 UFW\n'
+fi
 printf '  · 放行 SSH 端口 %s/TCP，拒绝其他未放行的入站连接（IPv4 和 IPv6），出站不限\n' "$ssh_port"
 printf '  · SSH 登录 5 分钟内失败 5 次，封禁该 IP 10 分钟\n'
 printf '  · 保留已有的 UFW 规则；备份后覆盖 /etc/fail2ban/jail.d/sshd.local\n'
@@ -1807,8 +1893,23 @@ printf '建议先打开服务商网页控制台备用，万一连不上可以从
 if (( reinit )); then confirm '仍要重新初始化？' || cancel '没有修改任何配置'
 else confirm '开始初始化？' || cancel '没有修改任何配置'; fi
 
-apt-get update
-apt-get install -y ufw fail2ban python3 python3-systemd nftables iproute2 util-linux
+if command -v apt-get >/dev/null; then
+    if ! apt-get update; then
+        [[ ${ID:-} != debian || ${VERSION_ID:-} != 10 ]] ||
+            die 'Debian 10 已停止维护，软件源搬到了 archive.debian.org，请先把 /etc/apt/sources.list 里的地址改过去。'
+        die '软件源更新失败，请检查网络和 /etc/apt/sources.list。'
+    fi
+    apt-get install -y ufw fail2ban python3 python3-systemd nftables iproute2 util-linux
+else
+    # Rocky and AlmaLinux: ufw and fail2ban come from EPEL; semanage labels new SSH ports for SELinux.
+    dnf install -y epel-release
+    dnf install -y ufw fail2ban-server fail2ban-systemd python3 python3-systemd nftables iproute util-linux \
+        policycoreutils-python-utils
+fi
+# EPEL's ufw ships with ENABLED=yes but nothing loaded, so every rule change fails until it is enabled.
+if [[ $(ufw status 2>/dev/null) == 'Status: inactive'* ]]; then
+    sed -i 's/^ENABLED=yes/ENABLED=no/' /etc/ufw/ufw.conf
+fi
 load_rules
 
 # Ensure the chosen SSH port actually has a TCP listener before changing UFW.
@@ -1851,11 +1952,28 @@ fi
 # Add again after enabling IPv6 so both address families have the SSH rule.
 allow_ssh "$ssh_port"
 for p in "${all_ssh_array[@]}"; do allow_ssh "$p"; done
+# Two firewalls would fight over the same traffic: carry firewalld's open ports over, then switch it off.
+if systemctl is-active --quiet firewalld 2>/dev/null; then
+    for item in $(firewall-cmd --list-ports) \
+                $(for service in $(firewall-cmd --list-services); do firewall-cmd --info-service="$service" |
+                    sed -n 's/^ *ports: *//p'; done); do
+        port=${item%/*} proto=${item#*/}
+        [[ $proto == tcp || $proto == udp ]] && valid_spec "${port/-/:}" || continue
+        [[ $proto == tcp ]] && [[ ,$all_ssh_ports,$ssh_port, == *,$port,* ]] && continue
+        port_rule add "${port/-/:}" "$proto" any
+        printf '已从 firewalld 搬过来：%s/%s\n' "${port/-/:}" "$proto"
+    done
+fi
+if systemctl is-enabled --quiet firewalld 2>/dev/null || systemctl is-active --quiet firewalld 2>/dev/null; then
+    systemctl disable --now --quiet firewalld
+    printf '已停用 firewalld，改由 UFW 管理防火墙。\n'
+fi
 ufw default deny incoming
 ufw default allow outgoing
 ufw logging low
 ufw --force enable
 ufw reload
+systemctl enable --quiet ufw
 
 systemctl enable --quiet fail2ban
 if ! systemctl restart fail2ban; then

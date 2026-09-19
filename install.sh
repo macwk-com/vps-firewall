@@ -7,10 +7,11 @@ fail() { printf '\n安装失败：%s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail '请以 root 运行安装命令。'
 . /etc/os-release
 case ${ID:-} in
-    debian) [[ ${VERSION_ID:-} =~ ^(11|12|13|14)$ || ${VERSION_CODENAME:-} == forky ]] ;;
-    ubuntu) [[ ${VERSION_ID:-} == 20.04 || ${VERSION_ID:-} == 22.04 ]] ;;
+    debian) [[ ${VERSION_ID:-} =~ ^(10|11|12|13|14)$ || ${VERSION_CODENAME:-} == forky ]] ;;
+    ubuntu) [[ ${VERSION_ID:-} =~ ^(18|20|22|24|26)\.04$ ]] ;;
+    rocky|almalinux) [[ ${VERSION_ID%%.*} =~ ^(8|9|10)$ ]] ;;
     *) false ;;
-esac || fail '目前支持 Debian 11–14 和 Ubuntu 20.04 / 22.04。'
+esac || fail '目前支持 Debian 10–14、Ubuntu 18.04–26.04、Rocky / AlmaLinux 8–10。'
 command -v curl >/dev/null || fail '请先安装 curl 和 ca-certificates。'
 
 repo='macwk-com/vps-firewall'
@@ -50,6 +51,17 @@ bash -n "$download" || fail '下载的脚本没有通过 Bash 语法检查。'
 chmod 755 "$download"
 mv -f "$download" "$destination"
 trap - EXIT INT TERM
+
+# sudo on RHEL-family systems only searches /usr/sbin and /usr/bin, so `sudo vpsfw` needs a link there.
+sudo_path=$(sudo -V 2>/dev/null | sed -n 's/^Value to override user.s \$PATH with: //p' || true)
+if [[ -n $sudo_path && :$sudo_path: != *:$install_dir:* ]]; then
+    link=/usr/bin/vpsfw
+    if [[ ! -e $link || ( -L $link && $(readlink -f "$link") == "$destination" ) ]]; then
+        ln -sfn "$destination" "$link"
+    else
+        printf '注意：%s 已被其他程序占用，普通用户请用 sudo %s 运行。\n' "$link" "$destination"
+    fi
+fi
 
 printf '\n安装完成。以后输入 vpsfw 即可打开菜单。\n'
 if [[ -t 0 && -t 1 ]]; then
