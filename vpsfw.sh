@@ -986,9 +986,12 @@ access_load() {
     done < <(rule_info --access "$ssh${session_port:+,$session_port}")
     docker_map=$(docker_ports)
 }
-# Who can reach each port; numbered when $1 is 1.
+# Who can reach each port; numbered when $1 is 1. A whitelist too long for one line is listed in full,
+# one source per line under the "谁能访问" column: hiding part of a whitelist defeats the point of the table.
 access_print() {
-    local numbered=${1:-0} line rp rproto rsources rssh name who owner n=0
+    local numbered=${1:-0} line rp rproto rsources rssh name who owner n=0 indent=25 source
+    local -a sources
+    (( ! numbered )) || indent=31
     if (( ${#access_entries[@]} == 0 )); then printf '  %s还没有放行任何端口%s\n' "$c_dim" "$c_off"; return 0; fi
     printf '  %s' "$c_dim"
     (( ! numbered )) || pad 编号 6
@@ -999,9 +1002,13 @@ access_print() {
         if (( rssh )); then name+=' (SSH)'
         elif [[ $rp != *:* ]] && docker_owner "${rproto/both/tcp}" "$rp"; then name+=' (Docker)'; fi
         access_label "$rsources" 44; who=$REPLY
+        IFS=, read -r -a sources <<< "$rsources"
+        # access_label shortened it ("只允许 N 个 IP：首个 等"): keep the count, list every source below.
+        if [[ $who == *' 等' ]] && (( ${#sources[@]} > 1 )); then who="只允许 ${#sources[@]} 个 IP："; else sources=(); fi
         printf '  '
         (( ! numbered )) || pad "$n" 6
         printf '%s%s%s\n' "$(pad "$name" 14)" "$(pad "$(proto_label "$rproto")" 9)" "$who"
+        for source in ${sources[@]+"${sources[@]}"}; do printf '%*s%s\n' "$indent" '' "$source"; done
     done
 }
 show_status() {
@@ -1346,6 +1353,8 @@ ssh_status() {
         whitelist=$(ssh_whitelist "$current")
         if [[ -n $whitelist ]]; then
             access_label "$whitelist" 44
+            # This row is a one-line summary; the full whitelist is in the access table.
+            [[ $REPLY != *' 等' ]] || REPLY+='，完整列表见「端口访问管理」'
             status_row 登录来源 '● 指定 IP' "$c_ok" "${REPLY#只允许 }"
         else
             status_row 登录来源 '所有 IP' '' '要限制来源，到「端口访问管理」修改 SSH 那一行'
