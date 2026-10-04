@@ -37,6 +37,7 @@ VPS Firewall — Linux 服务器安全与端口管理
   vpsfw ports add 5432 tcp 203.0.113.9        # 往白名单里再加一个 IP
   vpsfw ports delete 5432 tcp 203.0.113.9     # 从白名单里去掉一个 IP
   vpsfw ports change 443 8443 tcp    # 换端口号，谁能访问保持不变
+  vpsfw ports proto 443 tcp both     # 改协议（这里从 TCP 改成 TCP+UDP），谁能访问保持不变
   vpsfw ports close 5432 tcp         # 关闭端口（删掉它的全部放行规则）
   vpsfw status
   vpsfw ssh change 38217             # 开启新旧双端口并同步防护
@@ -1590,7 +1591,8 @@ ports_command() {
             printf '\n' ;;
         add|delete) ports_edit "$@" ;;
         set|close|change) ports_access "$@" ;;
-        *) die 'ports 支持 list、set、add、delete、change、close。' ;;
+        proto) ports_proto "$@" ;;
+        *) die 'ports 支持 list、set、add、delete、change、proto、close。' ;;
     esac
 }
 # add/delete: one source more or less on each of the ports.
@@ -1740,6 +1742,56 @@ ports_access() {
         printf '\nSSH 现在只允许名单里的 IP 登录。家里宽带的 IP 可能会变，变了就连不上，只能从服务商网页控制台进去改。\n'
     fi
     [[ $op == close ]] || { [[ $op != change ]] || ports=("$new"); access_hints; }
+}
+# proto: switch one port between TCP, UDP and both, keeping who may reach it. Like change, the new
+# protocol is opened before the dropped one is closed.
+ports_proto() {
+    local spec from to ssh protocol current sources='' covering added=() dropped=()
+    (( $# == 4 )) || die '用法：ports proto 端口 旧协议 新协议'
+    spec=$(clean_ports "$2")
+    valid_spec "$spec" || die '改协议每次只能改一个端口或范围。'
+    [[ ${spec%%:*} != "${spec##*:}" ]] || spec=${spec%%:*}
+    from=$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]'); to=$(printf '%s' "$4" | tr '[:upper:]' '[:lower:]')
+    for protocol in "$from" "$to"; do
+        [[ $protocol == tcp || $protocol == udp || $protocol == both ]] || die "协议只能是 tcp、udp 或 both（两者都要），收到：$protocol"
+    done
+    [[ $from != "$to" ]] || die '新旧协议相同。'
+    ssh=$(ssh_ports) || die '无法读取 SSH 配置，暂不修改规则。'
+    [[ ",$ssh,${session_port:-}," != *",$spec,"* ]] || die "$spec 是 SSH 端口，SSH 只用 TCP，不能改协议。"
+    local old=(tcp udp) protocols=(tcp udp)
+    [[ $from == both ]] || old=("$from")
+    [[ $to == both ]] || protocols=("$to")
+    # Validate everything before the first mutation.
+    for protocol in "${old[@]}"; do
+        current=$(port_sources "$spec" "$protocol" | paste -sd, -)
+        [[ -n $current ]] || die "${spec/:/-}/$protocol 没有放行规则，用 vpsfw ports list 查看。"
+        [[ -z $sources || $current == "$sources" ]] ||
+            die "${spec/:/-} 的 TCP 和 UDP 允许的 IP 不一样，请分别处理（ports set / close 加协议）。"
+        sources=$current
+        [[ " ${protocols[*]} " == *" $protocol "* ]] || dropped+=("$protocol")
+    done
+    for protocol in "${protocols[@]}"; do
+        [[ " ${old[*]} " != *" $protocol "* ]] || continue
+        check_ssh_collision "$spec" "$protocol"
+        [[ -z $(port_sources "$spec" "$protocol") ]] ||
+            die "${spec/:/-}/$protocol 已经有自己的放行规则；要两种协议都留，请把它们允许的 IP 改成一样，或者先关闭其中一个。"
+        added+=("$protocol")
+    done
+    access_label "$sources" 200
+    printf '\n改协议：%s  %s → %s  %s\n' "${spec/:/-}" "$(proto_label "$from")" "$(proto_label "$to")" "$REPLY"
+    backup_ufw
+    for protocol in ${added[@]+"${added[@]}"}; do sync_sources "$spec" "$protocol" "$sources"; done
+    for protocol in ${dropped[@]+"${dropped[@]}"}; do sync_sources "$spec" "$protocol" ''; done
+    load_rules
+    docker_sync || printf '注意：Docker 端口的规则没有同步成功，请用 ufw reload 查看原因。\n' >&2
+    prune_backups
+    for protocol in ${dropped[@]+"${dropped[@]}"}; do
+        covering=$(covering_rules "$spec" "$protocol")
+        [[ -z $covering ]] || printf '\n注意：%s/%s 仍被下面的规则放行：\n%s\n' "${spec/:/-}" "$protocol" "$covering"
+    done
+    (( ${#added[@]} )) || return 0
+    ports=("$spec"); protocols=("${added[@]}")
+    access_hints
 }
 # After opening ports: services not listening yet, the firewall switch and the cloud security group.
 access_hints() {
@@ -1913,9 +1965,12 @@ ask_ports() {
     done
     return 1
 }
+# ask_proto [1]: with 1 a blank answer goes back instead of picking TCP.
 ask_proto() {
-    local value
-    while ask value '协议：1) TCP  2) UDP  3) TCP+UDP  [回车 = 1]: '; do
+    local value prompt='协议：1) TCP  2) UDP  3) TCP+UDP  [回车 = 1]: '
+    (( ! ${1:-0} )) || prompt='协议：1) TCP  2) UDP  3) TCP+UDP（回车返回）: '
+    while ask value "$prompt"; do
+        [[ -n $value || ${1:-0} == 0 ]] || return 1
         case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
             ''|1|tcp) REPLY=tcp; return 0 ;;
             2|udp) REPLY=udp; return 0 ;;
@@ -1994,7 +2049,7 @@ access_add() {
         done
     done
     if [[ -n $taken ]]; then
-        printf '\n%s 已经放行过了。要改谁能访问，请用「修改某个端口允许的 IP」。\n' "$taken"; return 0
+        printf '\n%s 已经放行过了。要改谁能访问，请用「修改某个端口允许的 IP」；要换协议或加上另一种协议，请用「修改端口协议」。\n' "$taken"; return 0
     fi
     ask_who || return 0; sources=$REPLY
     access_label "$sources" 200
@@ -2077,6 +2132,30 @@ access_move() {
     confirm '确认？' y || { printf '已取消。\n'; return 0; }
     bash "$SELF" ports change "$e_port" "$new" "$e_proto" || true
 }
+access_proto() {
+    local to protocol taken=''
+    pick_entry '要改哪个端口的协议？输入编号（回车返回）: ' || return 0
+    entry "${picked[0]}"
+    if (( e_ssh )); then printf '\nSSH 只用 TCP，不能改协议。\n'; return 0; fi
+    access_label "$e_sources" 200
+    printf '\n%s  %s\n改成哪种协议？\n' "$e_name" "$REPLY"
+    ask_proto 1 || return 0; to=$REPLY
+    if [[ $to == "$e_proto" ]]; then printf '\n协议没有变化。\n'; return 0; fi
+    # A protocol being added may already have rules of its own, with a different whitelist.
+    for protocol in tcp udp; do
+        [[ $e_proto != both && $protocol != "$e_proto" && ( $to == both || $to == "$protocol" ) ]] || continue
+        [[ -z $(port_sources "$e_port" "$protocol") ]] || taken=$protocol
+    done
+    if [[ -n $taken ]]; then
+        printf '\n%s/%s 在列表里另有一行（允许的 IP 不同）。要两种协议都留，请用「修改某个端口允许的 IP」把两行改成一样；要只留一种，关闭另一行即可。\n' \
+            "${e_port/:/-}" "$taken"
+        return 0
+    fi
+    printf '\n将把 %s 从 %s 改成 %s，谁能访问保持不变（先放行新协议，再关闭不要的协议）。\n' \
+        "${e_port/:/-}" "$(proto_label "$e_proto")" "$(proto_label "$to")"
+    confirm '确认？' y || { printf '已取消。\n'; return 0; }
+    bash "$SELF" ports proto "$e_port" "$e_proto" "$to" || true
+}
 access_close() {
     local i targets=()
     pick_entry '要关闭哪几个？输入编号，多个用逗号分隔（回车返回）: ' 1 || return 0
@@ -2101,7 +2180,7 @@ docker_notes() {
     [[ -n ${docker_map:-} ]] || return 0
     if ! docker_managed; then
         while IFS=$'\t' read -r spec proto names; do list+="${list:+、}${spec/:/-}/$proto"; done <<< "$docker_map"
-        printf '\n  %sDocker 映射的端口（%s）不受防火墙控制，所有 IP 都能访问；选 7 接管。%s\n' "$c_err" "$list" "$c_off"
+        printf '\n  %sDocker 映射的端口（%s）不受防火墙控制，所有 IP 都能访问；可选「接管 Docker 端口」。%s\n' "$c_err" "$list" "$c_off"
         return 0
     fi
     cover_rules=$(rule_info --cover)
@@ -2122,7 +2201,7 @@ menu_ports() {
         [[ $(ufw status) == 'Status: active'* ]] ||
             printf '\n  %s防火墙没有启用，现在所有端口都对外开放；这些规则启用后才生效。%s\n' "$c_warn" "$c_off"
         docker_notes
-        actions=('放行新端口' '修改某个端口允许的 IP' '端口改成所有 IP 可访问' '换成别的端口号' '关闭端口' '查看端口监听')
+        actions=('放行新端口' '修改某个端口允许的 IP' '端口改成所有 IP 可访问' '换成别的端口号' '修改端口协议' '关闭端口' '查看端口监听')
         if command -v docker >/dev/null; then
             if docker_managed; then actions+=('取消接管 Docker 端口'); else actions+=('接管 Docker 端口'); fi
         fi
@@ -2133,9 +2212,10 @@ menu_ports() {
             2) access_edit ;;
             3) access_open ;;
             4) access_move ;;
-            5) access_close ;;
-            6) show_listeners || true ;;
-            7) printf '\n'; if docker_managed; then bash "$SELF" docker off || true; else bash "$SELF" docker on || true; fi ;;
+            5) access_proto ;;
+            6) access_close ;;
+            7) show_listeners || true ;;
+            8) printf '\n'; if docker_managed; then bash "$SELF" docker off || true; else bash "$SELF" docker on || true; fi ;;
         esac
         pause
     done
